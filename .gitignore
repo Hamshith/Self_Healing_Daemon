@@ -1,0 +1,6 @@
+.env
+/incidents/
+/incidents/*
+__pycache__/
+__pycache__/*
+venv/

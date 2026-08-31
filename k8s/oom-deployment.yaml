@@ -1,0 +1,30 @@
+# This deployment will go into a OOM error eventually.
+
+# Apply:  kubectl apply -f k8s/oom-deployment.yaml
+# Remove: kubectl delete -f k8s/oom-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oom-service
+  namespace: default
+  labels:
+    app: oom-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oom-service
+  template:
+    metadata:
+      labels:
+        app: oom-service
+    spec:
+      containers:
+        - name: oom-container
+          image: hamshith/oom-kill:latest
+          resources: 
+            requests:
+              memory: "100Mi"
+            limits:
+              memory: "100Mi"

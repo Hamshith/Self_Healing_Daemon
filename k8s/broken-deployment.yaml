@@ -1,0 +1,30 @@
+# This deployment will immediately go into CrashLoopBackOff.
+# The busybox container runs "exit 1" which causes it to
+# terminate with a non-zero exit code every time Kubernetes
+# restarts it.  After a few restarts the pod enters the
+# CrashLoopBackOff state, which the daemon will detect.
+#
+# Apply:  kubectl apply -f k8s/broken-deployment.yaml
+# Remove: kubectl delete -f k8s/broken-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken-service
+  namespace: default
+  labels:
+    app: broken-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: broken-service
+  template:
+    metadata:
+      labels:
+        app: broken-service
+    spec:
+      containers:
+        - name: broken-container
+          image: busybox:latest
+          command: ["sh", "-c", "echo 'Service crashing...' && exit 1"]

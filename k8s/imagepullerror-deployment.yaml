@@ -1,0 +1,25 @@
+# This deployment will fetch a image that doesnot exist to cause a crash.
+
+# Apply:  kubectl apply -f k8s/imagepullerror-deployment.yaml
+# Remove: kubectl delete -f k8s/imagepullerror-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-pull-error
+  namespace: default
+  labels:
+    app: image-pull-error
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: image-pull-error
+  template:
+    metadata:
+      labels:
+        app: image-pull-error
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:this-tag-does-not-exist

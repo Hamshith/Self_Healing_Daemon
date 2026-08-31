@@ -1,0 +1,56 @@
+# Healthy baseline application — two deployments that stay
+# running without errors.  Use these to verify the daemon
+# only flags genuinely broken pods.
+#
+# Apply:  kubectl apply -f k8s/sample-app.yaml
+# Remove: kubectl delete -f k8s/sample-app.yaml
+
+---
+# Frontend: nginx serving a default page
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: default
+  labels:
+    app: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:stable-alpine
+          ports:
+            - containerPort: 80
+
+---
+# Backend: Apache httpd serving a default page
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: default
+  labels:
+    app: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: httpd
+          image: httpd:alpine
+          ports:
+            - containerPort: 80

@@ -1,0 +1,20 @@
+# This  will create the network latency.
+
+# Apply:  kubectl apply -f k8s/networklatency-creater.yaml
+# Remove: kubectl delete -f k8s/networklatency-creater.yaml
+
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: chaos-creater
+  namespace: default
+spec:
+  action: delay
+  mode: all
+  selector:
+    namespaces: [default]
+    labelSelectors:
+      app: nginx
+  delay:
+    latency: "500ms"
+  duration: "3000s"

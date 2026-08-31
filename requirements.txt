@@ -1,0 +1,6 @@
+google-genai
+google-api-core
+kubernetes
+prometheus-api-client
+python-dotenv
+pydantic
