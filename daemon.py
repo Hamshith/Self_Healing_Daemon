@@ -80,17 +80,51 @@ async def _poll_cycle():
         print(f"[daemon] Error detecting resource anomalies: {exc}")
 
     for anomaly in anomalies:
-        # CPUThrottle/ApplicationCrash/etc. are keyed by pod_name+namespace.
-        # NetworkLatency is cluster-wide (a Chaos Mesh object, not a pod),
-        # so it has no pod_name — handle it separately and skip the
-        # per-pod log/event collection below.
+        # CPUThrottle/ApplicationCrash/etc. are keyed by pod_name+namespace
+        # and go through the normal per-pod log/event collection below.
+        # NetworkLatency is cluster-wide (a Chaos Mesh object, not a
+        # pod) — it has no pod_name, no logs, no restart count. Rather
+        # than skip Gemini diagnosis for it (which used to leave an
+        # incomplete record with no severity/root_cause/recommended
+        # action), build a synthetic incident with the chaos object's
+        # identity standing in for pod_name, and events synthesized
+        # from the NetworkChaos spec, so it goes through the exact
+        # same diagnosis + reporting pipeline as every other fault.
         if anomaly["fault_type"] == "NetworkLatency":
+            incident = {
+                **anomaly,
+                "pod_name": f"networkchaos/{anomaly.get('chaos_name', 'unknown')}",
+                "restart_count": 0,
+                "container_statuses": [],
+                "recent_logs": "(NetworkChaos CR — no pod logs; "
+                               "see kubernetes_events for injection details)",
+                "kubernetes_events": [
+                    {
+                        "reason": "NetworkChaosInjecting",
+                        "message": (
+                            f"NetworkChaos '{anomaly.get('chaos_name')}' is "
+                            f"actively injecting delay against selector "
+                            f"{anomaly.get('target_selector', {})}"
+                        ),
+                        "timestamp": anomaly.get("detected_at"),
+                        "type": "Warning",
+                    }
+                ],
+            }
+
             try:
-                reporter.print_incident_report(anomaly, {"root_cause_category": "NetworkLatency"})
+                diagnosis = llm_client.diagnose_incident(incident)
+            except Exception as exc:
+                print(f"[daemon] Error diagnosing NetworkLatency incident: {exc}")
+                continue
+
+            try:
+                reporter.print_incident_report(incident, diagnosis)
             except Exception as exc:
                 print(f"[daemon] Error printing NetworkLatency report: {exc}")
+
             try:
-                reporter.save_incident_report(anomaly, {"root_cause_category": "NetworkLatency"})
+                reporter.save_incident_report(incident, diagnosis)
             except Exception as exc:
                 print(f"[daemon] Error saving NetworkLatency report: {exc}")
             continue
