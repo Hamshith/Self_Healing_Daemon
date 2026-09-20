@@ -20,7 +20,7 @@ def _load_kube_config():
 
 def get_pod_restart_counts() -> dict:
     """
-    Return {pod_name: restart_count} for every pod in the cluster.
+    Return {"namespace/pod_name": restart_count} for every pod in the cluster.
 
     Primary source: Prometheus  kube_pod_container_status_restarts_total
     Fallback:       Kubernetes  Python client (pod.status.container_statuses)
@@ -32,10 +32,12 @@ def get_pod_restart_counts() -> dict:
         restart_counts: dict = {}
         for item in results:
             pod = item["metric"].get("pod", "unknown")
+            namespace = item["metric"].get("namespace", "default")
+            pod_key = f"{namespace}/{pod}"
             count = int(float(item["value"][1]))
             # Keep the highest count if a pod has multiple containers
-            if pod not in restart_counts or count > restart_counts[pod]:
-                restart_counts[pod] = count
+            if pod_key not in restart_counts or count > restart_counts[pod_key]:
+                restart_counts[pod_key] = count
         if restart_counts:
             return restart_counts
     except Exception:
@@ -52,9 +54,11 @@ def get_pod_restart_counts() -> dict:
                 max_restarts = max(
                     cs.restart_count for cs in pod.status.container_statuses
                 )
-                restart_counts[pod.metadata.name] = max_restarts
+                pod_key = f"{pod.metadata.namespace}/{pod.metadata.name}"
+                restart_counts[pod_key] = max_restarts
             else:
-                restart_counts[pod.metadata.name] = 0
+                pod_key = f"{pod.metadata.namespace}/{pod.metadata.name}"
+                restart_counts[pod_key] = 0
     except Exception as exc:
         print(f"[collector] Error fetching restart counts from K8s API: {exc}")
 

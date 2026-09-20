@@ -80,6 +80,8 @@ async def _poll_cycle():
     except Exception as exc:
         print(f"[daemon] Error detecting resource anomalies: {exc}")
 
+    db.record_heartbeat(len(restart_counts), len(anomalies))
+
     for anomaly in anomalies:
         # CPUThrottle/ApplicationCrash/etc. are keyed by pod_name+namespace
         # and go through the normal per-pod log/event collection below.
