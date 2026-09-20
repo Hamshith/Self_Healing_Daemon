@@ -94,9 +94,18 @@ async def _poll_cycle():
         # from the NetworkChaos spec, so it goes through the exact
         # same diagnosis + reporting pipeline as every other fault.
         if anomaly["fault_type"] == "NetworkLatency":
+            target_pods = anomaly.get("target_pods") or []
+            target_app = anomaly.get("target_app")
+            pod_name = (
+                target_pods[0]
+                if target_pods
+                else target_app
+                or f"networkchaos/{anomaly.get('chaos_name', 'unknown')}"
+            )
+
             incident = {
                 **anomaly,
-                "pod_name": f"networkchaos/{anomaly.get('chaos_name', 'unknown')}",
+                "pod_name": pod_name,
                 "restart_count": 0,
                 "container_statuses": [],
                 "recent_logs": "(NetworkChaos CR — no pod logs; "
@@ -106,7 +115,8 @@ async def _poll_cycle():
                         "reason": "NetworkChaosInjecting",
                         "message": (
                             f"NetworkChaos '{anomaly.get('chaos_name')}' is "
-                            f"actively injecting delay against selector "
+                            f"actively injecting delay against target app "
+                            f"{target_app or pod_name} and selector "
                             f"{anomaly.get('target_selector', {})}"
                         ),
                         "timestamp": anomaly.get("detected_at"),

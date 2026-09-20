@@ -266,6 +266,7 @@ def _detect_cpu_throttle(v1) -> list:
                             "pod_name": pod_name,
                             "namespace": namespace,
                             "fault_type": "CPUThrottle",
+                            "restart_count": 0,
                             "container_name": c_name,
                             "cpu_usage_millicores": usage_mc,
                             "cpu_limit_millicores": limit_mc,
@@ -294,17 +295,23 @@ def _detect_cpu_throttle(v1) -> list:
 # Fault 7: NetworkLatency  (via Chaos Mesh NetworkChaos CRD status)
 # ─────────────────────────────────────────────────────────────────
 
-def _detect_network_latency(custom_api) -> list:
+def _detect_network_latency(custom_api, v1=None) -> list:
     """
     Queries Chaos Mesh's NetworkChaos custom resources and flags any
-    that are currently in an injecting/active delay state. This
-    assumes you're injecting latency via Chaos Mesh, as in
-    k8s/networklatency-creater.yaml.
+    that are currently in an injecting/active delay state for a live
+    target app. This checks both the CRD status and the actual pods
+    selected by the NetworkChaos spec, so we only report latency when
+    it is actively affecting a real application object.
 
-    If Chaos Mesh isn't installed/reachable, this fails soft (returns
-    no anomalies) rather than crashing the daemon.
+    This matches the repo's use case: a NetworkChaos resource targeting
+    pods labeled `app: nginx` should be reported as NetworkLatency only
+    when those nginx pods actually exist in the cluster.
     """
     anomalies = []
+
+    if v1 is None:
+        _load_kube_config()
+        v1 = client.CoreV1Api()
 
     try:
         chaos_objs = custom_api.list_cluster_custom_object(
@@ -314,6 +321,12 @@ def _detect_network_latency(custom_api) -> list:
         print(f"[detector] Chaos Mesh NetworkChaos CRD unavailable, skipping: {exc}")
         return anomalies
 
+    try:
+        pods = v1.list_pod_for_all_namespaces(watch=False)
+    except Exception as exc:
+        print(f"[detector] Error listing pods for NetworkLatency target match: {exc}")
+        pods = None
+
     seen_this_poll = set()
 
     for item in chaos_objs.get("items", []):
@@ -321,26 +334,52 @@ def _detect_network_latency(custom_api) -> list:
         namespace = item["metadata"]["namespace"]
         spec = item.get("spec", {})
 
-        # Only "delay" actions correspond to the latency-injection
-        # scenario this fault type represents. NetworkChaos also
-        # supports loss/duplicate/corrupt/partition actions, which
-        # should not be reported as NetworkLatency.
         if spec.get("action") != "delay":
             continue
 
         key = f"{namespace}/{name}"
         seen_this_poll.add(key)
 
+        selector = spec.get("selector", {})
+        target_app = None
+        selected_pods = []
+
+        if pods is not None:
+            label_selectors = selector.get("labelSelectors", {}) or {}
+            target_namespaces = selector.get("namespaces") or [namespace]
+            pod_names = selector.get("podNames") or []
+
+            for pod in pods.items:
+                metadata = pod.metadata
+                labels = metadata.labels or {}
+                if metadata.namespace not in target_namespaces:
+                    continue
+                if pod_names and metadata.name not in pod_names:
+                    continue
+
+                matches = True
+                for label_name, expected_value in label_selectors.items():
+                    actual = labels.get(label_name)
+                    if isinstance(expected_value, list):
+                        if actual not in expected_value:
+                            matches = False
+                            break
+                    elif actual != expected_value:
+                        matches = False
+                        break
+
+                if matches:
+                    selected_pods.append(metadata.name)
+                    if target_app is None and labels.get("app"):
+                        target_app = labels["app"]
+
         status = item.get("status", {})
         conditions = status.get("conditions", [])
 
-        # Primary signal: the controller's observed AllInjected condition.
         is_injecting = any(
             c.get("type") == "AllInjected" and c.get("status") == "True"
             for c in conditions
         )
-        # If conditions are unavailable, use only an observed phase. The
-        # desired phase is a request, not proof that injection is active.
         if not conditions:
             experiment = status.get("experiment", {})
             observed_phase = (
@@ -349,6 +388,11 @@ def _detect_network_latency(custom_api) -> list:
                 or experiment.get("observedPhase")
             )
             is_injecting = observed_phase in ("Run", "Running")
+
+        if is_injecting and (not selected_pods):
+            # Keep the alarm only if the target app is actually present.
+            # A CR that exists but selects no live pods is not a real app latency incident.
+            is_injecting = False
 
         if is_injecting:
             if key in _previously_flagged_network:
@@ -360,16 +404,15 @@ def _detect_network_latency(custom_api) -> list:
                     "chaos_name": name,
                     "namespace": namespace,
                     "fault_type": "NetworkLatency",
-                    "target_selector": spec.get("selector", {}),
+                    "target_app": target_app,
+                    "target_pods": selected_pods,
+                    "target_selector": selector,
                     "detected_at": datetime.utcnow().isoformat() + "Z",
                 }
             )
         else:
             _previously_flagged_network.discard(key)
 
-    # A NetworkChaos CR that no longer exists (deleted, or recreated
-    # under a different resourceVersion after being deleted) must not
-    # stay permanently suppressed.
     for key in list(_previously_flagged_network):
         if key not in seen_this_poll:
             _previously_flagged_network.discard(key)
@@ -393,5 +436,5 @@ def detect_resource_anomalies() -> list:
 
     anomalies = []
     anomalies.extend(_detect_cpu_throttle(v1))
-    anomalies.extend(_detect_network_latency(custom_api))
+    anomalies.extend(_detect_network_latency(custom_api, v1))
     return anomalies
