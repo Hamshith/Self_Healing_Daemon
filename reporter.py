@@ -9,6 +9,7 @@ import os
 import re
 from datetime import datetime
 import config
+import db
 
 _SEVERITY_COLORS = {
     "critical": "\033[91m",
@@ -97,3 +98,12 @@ def save_incident_report(incident_data, diagnosis):
     with open(filepath, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2, default=str)
     print(f"[reporter] Incident saved → {filepath}")
+
+    # Also write to the operational DB so the frontend/API can query it.
+    # Kept as a separate try/except — a DB write failing should never
+    # cost you the JSON audit file you already have on disk.
+    try:
+        row_id = db.save_incident(incident_data, diagnosis)
+        print(f"[reporter] Incident saved to DB → id={row_id}")
+    except Exception as exc:
+        print(f"[reporter] Warning: failed to save incident to DB: {exc}")
