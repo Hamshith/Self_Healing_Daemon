@@ -42,7 +42,7 @@ RECENT POD LOGS (last 50 lines):
 Respond with this exact JSON structure:
 {{
   "root_cause": "one sentence describing the most likely root cause",
-  "root_cause_category": "one of: ImagePullError | OOMKilled | ApplicationCrash | ConfigError | DependencyFailure | ResourceLimit | Unknown",
+  "root_cause_category": "one of: ImagePullError | OOMKilled | ApplicationCrash | ConfigError | DependencyFailure | ResourceLimit | PendingScheduling | CPUThrottle | NetworkLatency | Unknown",
   "confidence": "one of: high | medium | low",
   "evidence": ["list", "of", "specific", "log lines", "or events that support this diagnosis"],
   "severity": "one of: critical | high | medium | low",
