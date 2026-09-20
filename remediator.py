@@ -5,7 +5,7 @@ Given an (incident, diagnosis) pair produced by detector.py + llm_client.py,
 decide whether to auto-remediate and, if so, execute a real action against
 the cluster via the Kubernetes Python client.
 
-Decision tree (per roadmap Phase 2 Step 3):
+Decision tree:
     ImagePullError    -> escalate only (can't fix a bad tag automatically)
     OOMKilled         -> patch the owning Deployment's memory limit +25%
     ApplicationCrash  -> delete the pod (K8s recreates it cleanly)
