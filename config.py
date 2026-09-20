@@ -26,6 +26,6 @@ INCIDENTS_DIR = "./incidents"
 DB_PATH = "./incidents.db"
 
 # ── LLM (Google Gemini) ────────────────────────────────
-MODEL = "gemini-2.5-flash"
+MODEL = "gemini-3.5-flash"
 MAX_TOKENS = 4096
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
