@@ -135,9 +135,9 @@ def _parse_memory_to_mi(mem_str: str) -> float:
     unit_to_mi = {
         "Mi": 1,
         "Gi": 1024,
-        "M": 1000 / 1024 ** 0 * (1_000_000 / (1024 * 1024)),  # decimal M -> Mi
-        "G": (1_000_000_000 / (1024 * 1024)),                  # decimal G -> Mi
-        "": 1 / (1024 * 1024),                                 # bare bytes -> Mi
+        "M": 1_000_000 / (1024 ** 2),  # decimal M -> Mi
+        "G": 1_000_000_000 / (1024 ** 2),  # decimal G -> Mi
+        "": 1 / (1024 ** 2),  # bare bytes -> Mi
     }
 
     if unit not in unit_to_mi:
@@ -306,6 +306,7 @@ def _patch_memory_limit(incident: dict, diagnosis: dict, increase_pct: float = 0
         pod_name,
         "patch_memory",
         {
+            "namespace": namespace,
             "deployment_name": deployment_name,
             "container_name": container.name,
             "original_memory_limit": current_mem_str,
