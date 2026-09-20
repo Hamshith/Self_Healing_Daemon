@@ -14,6 +14,7 @@ import collector
 import detector
 import llm_client
 import reporter
+import db
 
 
 BANNER = r"""
@@ -71,9 +72,29 @@ async def _poll_cycle():
         anomalies = detector.detect_anomalies(restart_counts)
     except Exception as exc:
         print(f"[daemon] Error detecting anomalies: {exc}")
-        return
+        anomalies = []
+
+    try:
+        anomalies += detector.detect_resource_anomalies()
+    except Exception as exc:
+        print(f"[daemon] Error detecting resource anomalies: {exc}")
 
     for anomaly in anomalies:
+        # CPUThrottle/ApplicationCrash/etc. are keyed by pod_name+namespace.
+        # NetworkLatency is cluster-wide (a Chaos Mesh object, not a pod),
+        # so it has no pod_name — handle it separately and skip the
+        # per-pod log/event collection below.
+        if anomaly["fault_type"] == "NetworkLatency":
+            try:
+                reporter.print_incident_report(anomaly, {"root_cause_category": "NetworkLatency"})
+            except Exception as exc:
+                print(f"[daemon] Error printing NetworkLatency report: {exc}")
+            try:
+                reporter.save_incident_report(anomaly, {"root_cause_category": "NetworkLatency"})
+            except Exception as exc:
+                print(f"[daemon] Error saving NetworkLatency report: {exc}")
+            continue
+
         pod = anomaly["pod_name"]
         ns = anomaly["namespace"]
 
@@ -123,6 +144,7 @@ async def _poll_cycle():
 async def main():
     """Daemon main loop."""
     _startup_checks()
+    db.init_db()
     print("Daemon started. Press Ctrl+C to stop.\n")
 
     try:
