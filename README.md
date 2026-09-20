@@ -47,6 +47,7 @@ copy .env.example .env      # Windows
 
 ```bash
 minikube start --memory=4096 --cpus=2 --driver=docker
+minikube addons enable metrics-server
 ```
 
 Verify the cluster is running:
