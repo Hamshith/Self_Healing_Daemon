@@ -13,6 +13,7 @@ import config
 import collector
 import detector
 import llm_client
+import remediator
 import reporter
 import db
 
@@ -123,10 +124,23 @@ async def _poll_cycle():
             except Exception as exc:
                 print(f"[daemon] Error printing NetworkLatency report: {exc}")
 
+            incident_id = None
             try:
-                reporter.save_incident_report(incident, diagnosis)
+                incident_id = reporter.save_incident_report(incident, diagnosis)
             except Exception as exc:
                 print(f"[daemon] Error saving NetworkLatency report: {exc}")
+
+            try:
+                remediation = remediator.remediate(incident, diagnosis)
+            except Exception as exc:
+                print(f"[daemon] Error remediating {incident.get('pod_name')}: {exc}")
+                remediation = None
+
+            if incident_id is not None and remediation is not None:
+                try:
+                    db.update_remediation_status(incident_id, remediation["status"])
+                except Exception as exc:
+                    print(f"[daemon] Error updating remediation status: {exc}")
             continue
 
         pod = anomaly["pod_name"]
@@ -164,10 +178,23 @@ async def _poll_cycle():
         except Exception as exc:
             print(f"[daemon] Error printing report for {pod}: {exc}")
 
+        incident_id = None
         try:
-            reporter.save_incident_report(incident, diagnosis)
+            incident_id = reporter.save_incident_report(incident, diagnosis)
         except Exception as exc:
             print(f"[daemon] Error saving report for {pod}: {exc}")
+
+        try:
+            remediation = remediator.remediate(incident, diagnosis)
+        except Exception as exc:
+            print(f"[daemon] Error remediating {incident.get('pod_name')}: {exc}")
+            remediation = None
+
+        if incident_id is not None and remediation is not None:
+            try:
+                db.update_remediation_status(incident_id, remediation["status"])
+            except Exception as exc:
+                print(f"[daemon] Error updating remediation status: {exc}")
 
     now = datetime.utcnow().isoformat() + "Z"
     print(f"[{now}] Checked cluster — "

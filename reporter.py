@@ -105,5 +105,7 @@ def save_incident_report(incident_data, diagnosis):
     try:
         row_id = db.save_incident(incident_data, diagnosis)
         print(f"[reporter] Incident saved to DB → id={row_id}")
+        return row_id
     except Exception as exc:
         print(f"[reporter] Warning: failed to save incident to DB: {exc}")
+        return None

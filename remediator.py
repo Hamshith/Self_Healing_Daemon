@@ -179,6 +179,7 @@ def _escalate(incident: dict, diagnosis: dict, reason: str) -> dict:
     result = {
         "action_taken": "escalate",
         "success": True,  # "success" here means "escalation was recorded", not "problem solved"
+        "status": "escalated",
         "reason": reason,
         "pod_name": incident.get("pod_name"),
         "namespace": incident.get("namespace"),
@@ -209,6 +210,7 @@ def _delete_pod(incident: dict, diagnosis: dict) -> dict:
         return {
             "action_taken": "delete_pod",
             "success": False,
+            "status": "failed",
             "reason": f"Could not read pod before delete: {exc}",
             "pod_name": pod_name,
             "namespace": namespace,
@@ -225,6 +227,7 @@ def _delete_pod(incident: dict, diagnosis: dict) -> dict:
         return {
             "action_taken": "delete_pod",
             "success": False,
+            "status": "failed",
             "reason": f"Delete failed: {exc}",
             "pod_name": pod_name,
             "namespace": namespace,
@@ -235,6 +238,7 @@ def _delete_pod(incident: dict, diagnosis: dict) -> dict:
     return {
         "action_taken": "delete_pod",
         "success": True,
+        "status": "remediated",
         "reason": "Pod deleted; owning controller will recreate it.",
         "pod_name": pod_name,
         "namespace": namespace,
@@ -277,6 +281,7 @@ def _patch_memory_limit(incident: dict, diagnosis: dict, increase_pct: float = 0
         return {
             "action_taken": "patch_memory",
             "success": False,
+            "status": "failed",
             "reason": f"Could not read Deployment {deployment_name}: {exc}",
             "pod_name": pod_name,
             "namespace": namespace,
@@ -342,6 +347,7 @@ def _patch_memory_limit(incident: dict, diagnosis: dict, increase_pct: float = 0
         return {
             "action_taken": "patch_memory",
             "success": False,
+            "status": "failed",
             "reason": f"Patch failed: {exc}",
             "pod_name": pod_name,
             "namespace": namespace,
@@ -355,6 +361,7 @@ def _patch_memory_limit(incident: dict, diagnosis: dict, increase_pct: float = 0
     return {
         "action_taken": "patch_memory",
         "success": True,
+        "status": "remediated",
         "reason": f"Memory limit increased {current_mem_str} -> {new_mem_str}",
         "pod_name": pod_name,
         "namespace": namespace,
