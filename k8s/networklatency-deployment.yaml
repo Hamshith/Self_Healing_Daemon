@@ -1,6 +1,8 @@
 # This deployment will act as a service for which the network latency will be there.
 
 # Apply:  kubectl apply -f k8s/networklatency-deployment.yaml
+# To see the network latency : curl -o /dev/null -s -w "%{time_total}\n" http://nginx-service
+#kubectl run tmp-curl --rm -it --image=curlimages/curl --restart=Never -- sh
 # Remove: kubectl delete -f k8s/networklatency-deployment.yaml
 
 apiVersion: apps/v1

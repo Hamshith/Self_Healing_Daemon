@@ -1,6 +1,7 @@
 # This deployment will hit CPU throttle once the service hits the cpu usage limit.
 
 # Apply:  kubectl apply -f k8s/cputhrottle-deployment.yaml
+# Prometeus commands : container_cpu_cfs_throttled_periods_total , container_cpu_cfs_periods_total
 # Remove: kubectl delete -f k8s/cputhrottle-deployment.yaml
 
 apiVersion: apps/v1
