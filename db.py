@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime
+from typing import Optional
 import config
 
 DB_PATH = getattr(config, "DB_PATH", "./incidents.db")
@@ -52,6 +53,13 @@ CREATE TABLE IF NOT EXISTS incident_status_history (
     FOREIGN KEY (incident_id) REFERENCES incidents(id)
 );
 CREATE INDEX IF NOT EXISTS idx_status_history_incident ON incident_status_history(incident_id);
+
+CREATE TABLE IF NOT EXISTS daemon_heartbeat (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    last_check_at    TEXT NOT NULL,
+    pods_monitored   INTEGER NOT NULL DEFAULT 0,
+    anomalies_found INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -68,6 +76,42 @@ def init_db():
     try:
         conn.executescript(_SCHEMA)
         conn.commit()
+    finally:
+        conn.close()
+
+
+def record_heartbeat(pods_monitored: int, anomalies_found: int,
+                     checked_at: Optional[str] = None):
+    """Store the latest successful daemon poll for the dashboard health check."""
+    checked_at = checked_at or datetime.utcnow().isoformat() + "Z"
+    conn = _get_conn()
+    try:
+        conn.execute(
+            """
+            INSERT INTO daemon_heartbeat
+                (id, last_check_at, pods_monitored, anomalies_found)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                last_check_at = excluded.last_check_at,
+                pods_monitored = excluded.pods_monitored,
+                anomalies_found = excluded.anomalies_found
+            """,
+            (checked_at, pods_monitored, anomalies_found),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_heartbeat() -> Optional[dict]:
+    """Return the latest daemon poll, or None before the first successful poll."""
+    conn = _get_conn()
+    try:
+        row = conn.execute(
+            "SELECT last_check_at, pods_monitored, anomalies_found "
+            "FROM daemon_heartbeat WHERE id = 1"
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 
@@ -111,6 +155,8 @@ def save_incident(incident_data: dict, diagnosis: dict) -> int:
             ),
         )
         conn.commit()
+        if cur.lastrowid is None:
+            raise RuntimeError("SQLite did not return an incident id")
         return cur.lastrowid
     finally:
         conn.close()
@@ -166,7 +212,8 @@ def update_remediation_status(incident_id: int, status: str):
 
 
 def get_all_incidents(limit: int = 100, offset: int = 0,
-                       fault_type: str = None, remediation_status: str = None) -> list:
+                       fault_type: Optional[str] = None,
+                       remediation_status: Optional[str] = None) -> list:
     """Return incidents newest-first, optionally filtered and paginated."""
     conn = _get_conn()
     try:
@@ -192,7 +239,7 @@ def get_all_incidents(limit: int = 100, offset: int = 0,
         conn.close()
 
 
-def get_incident_by_id(incident_id: int) -> dict:
+def get_incident_by_id(incident_id: int) -> Optional[dict]:
     """Return one incident by id, or None if it doesn't exist."""
     conn = _get_conn()
     try:

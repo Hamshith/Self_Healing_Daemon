@@ -24,9 +24,10 @@ CPU_THROTTLE_CONSECUTIVE_POLLS = 3       # how many polls in a row at-limit befo
 CPU_THROTTLE_RATIO = 0.95                # usage/limit ratio considered "throttled"
 
 # ── State tracking between poll cycles ──────────────────
-_previously_flagged: dict = {}        # pod_name -> (fault_type, restart_count)
+_previously_flagged: dict = {}        # "namespace/pod" -> (fault_type, restart_count)
 _cpu_throttle_streak: dict = {}       # "namespace/pod/container" -> consecutive at-limit count
-_previously_flagged_resource: set = set()  # keys already reported this incident
+_previously_flagged_cpu: set = set()
+_previously_flagged_network: set = set()
 
 
 def _load_kube_config():
@@ -34,6 +35,10 @@ def _load_kube_config():
         k8s_config.load_incluster_config()
     except k8s_config.ConfigException:
         k8s_config.load_kube_config()
+
+
+def _pod_key(namespace: str, pod_name: str) -> str:
+    return f"{namespace}/{pod_name}"
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -105,10 +110,7 @@ def detect_anomalies(restart_counts: dict) -> list:
     v1 = client.CoreV1Api()
 
     anomalies: list = []
-
-    for pod_name in list(_previously_flagged.keys()):
-        if restart_counts.get(pod_name, 0) == 0:
-            del _previously_flagged[pod_name]
+    active_fault_keys = set()
 
     try:
         pods = v1.list_pod_for_all_namespaces(watch=False)
@@ -119,7 +121,10 @@ def detect_anomalies(restart_counts: dict) -> list:
     for pod in pods.items:
         pod_name = pod.metadata.name
         namespace = pod.metadata.namespace
-        restart_count = restart_counts.get(pod_name, 0)
+        pod_key = _pod_key(namespace, pod_name)
+        restart_count = restart_counts.get(
+            pod_key, restart_counts.get(pod_name, 0)
+        )
 
         fault_type = None
         statuses_info: list = []
@@ -145,10 +150,11 @@ def detect_anomalies(restart_counts: dict) -> list:
         if fault_type is None:
             continue
 
-        prev = _previously_flagged.get(pod_name)
+        prev = _previously_flagged.get(pod_key)
+        active_fault_keys.add(pod_key)
         if prev == (fault_type, restart_count):
             continue
-        _previously_flagged[pod_name] = (fault_type, restart_count)
+        _previously_flagged[pod_key] = (fault_type, restart_count)
 
         anomalies.append(
             {
@@ -160,6 +166,13 @@ def detect_anomalies(restart_counts: dict) -> list:
                 "detected_at": datetime.utcnow().isoformat() + "Z",
             }
         )
+
+    # Only retain suppression state for faults observed in this successful
+    # listing. Restart counts alone cannot identify recovery: a recovered
+    # pod may keep a non-zero count, while Pending pods commonly have zero.
+    for pod_key in list(_previously_flagged):
+        if pod_key not in active_fault_keys:
+            del _previously_flagged[pod_key]
 
     return anomalies
 
@@ -189,7 +202,7 @@ def _detect_cpu_throttle(v1) -> list:
     Requires metrics-server to be installed in the cluster
     (`kubectl top pods` should work if it is).
     """
-    global _cpu_throttle_streak, _previously_flagged_resource
+    global _cpu_throttle_streak, _previously_flagged_cpu
 
     anomalies = []
     custom_api = client.CustomObjectsApi()
@@ -239,15 +252,15 @@ def _detect_cpu_throttle(v1) -> list:
                     _cpu_throttle_streak[key] = _cpu_throttle_streak.get(key, 0) + 1
                 else:
                     _cpu_throttle_streak[key] = 0
-                    _previously_flagged_resource.discard(key)
+                    _previously_flagged_cpu.discard(key)
 
                 seen_this_poll.add(key)
 
                 if (
                     _cpu_throttle_streak[key] >= CPU_THROTTLE_CONSECUTIVE_POLLS
-                    and key not in _previously_flagged_resource
+                    and key not in _previously_flagged_cpu
                 ):
-                    _previously_flagged_resource.add(key)
+                    _previously_flagged_cpu.add(key)
                     anomalies.append(
                         {
                             "pod_name": pod_name,
@@ -272,7 +285,7 @@ def _detect_cpu_throttle(v1) -> list:
     for key in list(_cpu_throttle_streak.keys()):
         if key not in seen_this_poll:
             del _cpu_throttle_streak[key]
-            _previously_flagged_resource.discard(key)
+            _previously_flagged_cpu.discard(key)
 
     return anomalies
 
@@ -326,17 +339,21 @@ def _detect_network_latency(custom_api) -> list:
             c.get("type") == "AllInjected" and c.get("status") == "True"
             for c in conditions
         )
-        # Fallback only if conditions are absent entirely (older Chaos
-        # Mesh versions). desiredPhase reflects the *requested* phase,
-        # not necessarily observed injection, so this is intentionally
-        # a weaker signal used only when nothing better is available.
+        # If conditions are unavailable, use only an observed phase. The
+        # desired phase is a request, not proof that injection is active.
         if not conditions:
-            is_injecting = status.get("experiment", {}).get("desiredPhase") == "Run"
+            experiment = status.get("experiment", {})
+            observed_phase = (
+                status.get("phase")
+                or experiment.get("phase")
+                or experiment.get("observedPhase")
+            )
+            is_injecting = observed_phase in ("Run", "Running")
 
         if is_injecting:
-            if key in _previously_flagged_resource:
+            if key in _previously_flagged_network:
                 continue
-            _previously_flagged_resource.add(key)
+            _previously_flagged_network.add(key)
 
             anomalies.append(
                 {
@@ -348,21 +365,14 @@ def _detect_network_latency(custom_api) -> list:
                 }
             )
         else:
-            _previously_flagged_resource.discard(key)
+            _previously_flagged_network.discard(key)
 
     # A NetworkChaos CR that no longer exists (deleted, or recreated
     # under a different resourceVersion after being deleted) must not
     # stay permanently suppressed.
-    stale_keys = {
-        k for k in list(_previously_flagged_resource)
-        if "/" in k and k not in seen_this_poll and k.count("/") == 1
-    }
-    # Only prune keys that look like NetworkChaos keys (namespace/name,
-    # one slash) — CPU throttle keys have two slashes
-    # (namespace/pod/container) and are pruned separately in
-    # _detect_cpu_throttle, so this won't touch them.
-    for key in stale_keys:
-        _previously_flagged_resource.discard(key)
+    for key in list(_previously_flagged_network):
+        if key not in seen_this_poll:
+            _previously_flagged_network.discard(key)
 
     return anomalies
 

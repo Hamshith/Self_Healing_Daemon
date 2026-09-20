@@ -15,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_last_check_timestamp = None
+HEARTBEAT_TIMEOUT_SECONDS = 90
 
 
 def _json_safe(row):
@@ -27,9 +27,7 @@ def _json_safe(row):
 
 @app.on_event("startup")
 def startup():
-    global _last_check_timestamp
     db.init_db()
-    _last_check_timestamp = datetime.now(timezone.utc).isoformat()
 
 
 @app.get("/incidents")
@@ -50,10 +48,22 @@ def incident(incident_id: int):
 
 @app.get("/health")
 def health():
+    heartbeat = db.get_heartbeat()
+    if heartbeat is None:
+        return {
+            "status": "stale",
+            "pods_monitored": None,
+            "last_check_timestamp": None,
+        }
+
+    checked_at = datetime.fromisoformat(
+        heartbeat["last_check_at"].replace("Z", "+00:00")
+    )
+    age_seconds = (datetime.now(timezone.utc) - checked_at).total_seconds()
     return {
-        "status": "ok",
-        "pods_monitored": None,
-        "last_check_timestamp": _last_check_timestamp,
+        "status": "ok" if age_seconds < HEARTBEAT_TIMEOUT_SECONDS else "stale",
+        "pods_monitored": heartbeat["pods_monitored"],
+        "last_check_timestamp": heartbeat["last_check_at"],
     }
 
 
