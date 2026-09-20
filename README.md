@@ -109,6 +109,20 @@ python daemon.py
 
 You should see a startup banner followed by periodic cluster checks every 30 seconds.
 
+## 8a. Run the dashboard
+
+The dashboard reads the same `incidents.db` file written by the daemon. Start the
+API and frontend in separate terminals from `Self_Healing_Daemon`:
+
+```bash
+uvicorn api:app --reload --port 8000
+cd frontend
+npm install
+npm run dev
+```
+
+Open the Vite URL shown in the terminal (normally `http://localhost:5173`).
+
 ---
 
 ## 8. Inject a Fault
