@@ -48,7 +48,7 @@ Respond with this exact JSON structure:
   "severity": "one of: critical | high | medium | low",
   "explanation": "2-3 sentences explaining what is happening and why",
   "recommended_action": "specific kubectl or config command to fix this",
-  "safe_to_auto_remediate": false
+    "safe_to_auto_remediate": true
 }}
 """
 

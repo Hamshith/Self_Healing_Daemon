@@ -7,3 +7,5 @@ venv/
 frontend/node_modules/
 frontend/dist/
 incidents.db
+/rollbacks/
+/rollbacks/*

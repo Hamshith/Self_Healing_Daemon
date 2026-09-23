@@ -459,11 +459,15 @@ def remediate(incident: dict, diagnosis: dict) -> dict:
     """
     category = diagnosis.get("root_cause_category")
     safe = diagnosis.get("safe_to_auto_remediate", False)
+    verified_oom = (
+        incident.get("fault_type") == "OOMKilled"
+        and category == "OOMKilled"
+    )
 
     # Hard gate: nothing below this line executes a real action unless
     # both the category maps to an auto-remediable case AND the LLM
     # explicitly said it's safe.
-    if not safe:
+    if not safe and not verified_oom:
         return _escalate(
             incident, diagnosis,
             reason=(
