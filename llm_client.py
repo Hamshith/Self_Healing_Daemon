@@ -11,6 +11,7 @@ from google import genai
 from google.genai import types
 from google.api_core.exceptions import ResourceExhausted
 import config
+import rag_engine
 
 
 SYSTEM_PROMPT = (
@@ -39,6 +40,12 @@ RECENT KUBERNETES EVENTS (last 10 min):
 RECENT POD LOGS (last 50 lines):
 {recent_logs}
 
+RELEVANT RUNBOOK CONTEXT:
+{runbook_context}
+
+SERVICE CORRELATION CONTEXT:
+{correlation_context}
+
 Respond with this exact JSON structure:
 {{
   "root_cause": "one sentence describing the most likely root cause",
@@ -64,6 +71,18 @@ def _strip_markdown_fences(text: str) -> str:
 
 def _build_user_prompt(incident_data: dict) -> str:
     """Render the user prompt template with incident signals."""
+    query = " ".join(
+        str(value)
+        for value in (
+            incident_data.get("pod_name", ""),
+            incident_data.get("fault_type", ""),
+            incident_data.get("root_cause", ""),
+        )
+        if value
+    )
+    runbook_context = incident_data.get("runbook_context")
+    if runbook_context is None:
+        runbook_context = rag_engine.format_context(rag_engine.retrieve(query))
     return USER_PROMPT_TEMPLATE.format(
         pod_name=incident_data["pod_name"],
         namespace=incident_data["namespace"],
@@ -76,6 +95,11 @@ def _build_user_prompt(incident_data: dict) -> str:
             incident_data.get("kubernetes_events", []), indent=2
         ),
         recent_logs=incident_data.get("recent_logs", "(no logs available)"),
+        runbook_context=runbook_context,
+        correlation_context=json.dumps(
+            incident_data.get("correlation_context", "(no related failures)"),
+            indent=2,
+        ),
     )
 
 

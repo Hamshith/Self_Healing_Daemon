@@ -16,6 +16,9 @@ import llm_client
 import remediator
 import reporter
 import db
+import rag_engine
+import incident_report_generator
+import correlation
 
 
 BANNER = r"""
@@ -48,6 +51,12 @@ def _startup_checks():
         print("Copy .env.example to .env and add your API key.")
         sys.exit(1)
 
+    try:
+        count = rag_engine.build_index()
+        print(f"[rag_engine] Indexed {count} runbook chunks.")
+    except Exception as exc:
+        print(f"[rag_engine] Warning: runbook index unavailable: {exc}")
+
     prom_ok = _check_prometheus()
     prom_status = config.PROMETHEUS_URL if prom_ok else "UNREACHABLE — using K8s API fallback"
     if not prom_ok:
@@ -79,6 +88,11 @@ async def _poll_cycle():
         anomalies += detector.detect_resource_anomalies()
     except Exception as exc:
         print(f"[daemon] Error detecting resource anomalies: {exc}")
+
+    try:
+        anomalies = correlation.correlate(anomalies)
+    except Exception as exc:
+        print(f"[daemon] Error correlating anomalies: {exc}")
 
     db.record_heartbeat(len(restart_counts), len(anomalies))
 
@@ -156,6 +170,10 @@ async def _poll_cycle():
                     db.update_remediation_status(incident_id, remediation["status"])
                 except Exception as exc:
                     print(f"[daemon] Error updating remediation status: {exc}")
+            try:
+                incident_report_generator.generate_report(incident, diagnosis, remediation)
+            except Exception as exc:
+                print(f"[daemon] Error generating NetworkLatency post-mortem: {exc}")
             continue
 
         pod = anomaly["pod_name"]
@@ -210,6 +228,11 @@ async def _poll_cycle():
                 db.update_remediation_status(incident_id, remediation["status"])
             except Exception as exc:
                 print(f"[daemon] Error updating remediation status: {exc}")
+
+        try:
+            incident_report_generator.generate_report(incident, diagnosis, remediation)
+        except Exception as exc:
+            print(f"[daemon] Error generating post-mortem for {pod}: {exc}")
 
     now = datetime.utcnow().isoformat() + "Z"
     print(f"[{now}] Checked cluster — "
