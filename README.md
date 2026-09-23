@@ -1,6 +1,6 @@
 # LLM-Augmented Self-Healing Daemon for Kubernetes
 
-A Python daemon that monitors a minikube Kubernetes cluster, detects pods in **CrashLoopBackOff** state using Prometheus metrics and the Kubernetes Event API, and leverages **Google Gemini** to diagnose incidents automatically.
+A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Kubernetes failure modes, measures real in-cluster network latency, and leverages **Google Gemini** to diagnose incidents automatically.
 
 ---
 
@@ -73,7 +73,10 @@ helm install prometheus prometheus-community/kube-prometheus-stack \
 # Port-forward Prometheus to localhost:9090
 kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090 &
 ```
-## 5. Install ChaosMesh via Helm
+
+> **Note:** Prometheus is optional. The daemon falls back to the Kubernetes API if Prometheus is not reachable.
+
+## 5. Install Chaos Mesh via Helm
 
 ```bash
 # Add the ChaosMesh community Helm chart repo
@@ -85,15 +88,17 @@ helm install chaos-mesh chaos-mesh/chaos-mesh -n=chaos-mesh --create-namespace -
 
 ```
 
+Chaos Mesh is required only for the NetworkLatency scenario. Verify that its
+controller and daemon pods are ready before applying a NetworkChaos resource:
 
-> **Note:** Prometheus is optional. The daemon falls back to the Kubernetes API if Prometheus is not reachable.
+```bash
+kubectl get pods -n chaos-mesh
+```
 
-For NetworkChaos detection, start the nginx deployment first and then apply
-`k8s/networklatency-creater.yaml`. The daemon creates a short-lived curl pod
-inside the cluster and measures the configured service URL. It reports
-`NetworkLatency` only when Chaos Mesh reports `AllInjected=True` and the
-measured latency is at least `NETWORK_LATENCY_THRESHOLD_MS` (250 ms by
-default).
+The daemon creates a short-lived curl pod inside the cluster and measures the
+configured service URL. It reports `NetworkLatency` only when Chaos Mesh
+reports `AllInjected=True` and measured latency is at least
+`NETWORK_LATENCY_THRESHOLD_MS` (250 ms by default).
 
 These settings can be overridden in `.env`:
 
@@ -101,7 +106,7 @@ These settings can be overridden in `.env`:
 NETWORK_LATENCY_TARGET_URL=http://nginx-service.default.svc.cluster.local
 NETWORK_LATENCY_THRESHOLD_MS=250
 NETWORK_LATENCY_PROBE_IMAGE=curlimages/curl:8.10.1
-NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS=10
+NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS=60
 ```
 
 The Kubernetes identity running the daemon needs permission to create, read,
@@ -109,7 +114,7 @@ exec into, and delete pods in the probe namespace.
 
 ---
 
-## 6. Deploy Sample Apps
+## 6. Deploy the Healthy Baseline
 
 ```bash
 # Deploy healthy baseline pods (nginx frontend + httpd backend)
@@ -129,7 +134,7 @@ python daemon.py
 
 You should see a startup banner followed by periodic cluster checks every 30 seconds.
 
-## 8a. Run the dashboard
+## 8. Run the Dashboard
 
 The dashboard reads the same `incidents.db` file written by the daemon. Start the
 API and frontend in separate terminals from `Self_Healing_Daemon`:
@@ -145,21 +150,127 @@ Open the Vite URL shown in the terminal (normally `http://localhost:5173`).
 
 ---
 
-## 8. Inject a Fault
+## 9. Inject Fault Scenarios
 
-In a **separate terminal**, apply the broken deployment:
+Apply one scenario at a time from a separate terminal. Wait for the affected
+pod to be created before checking its status. Do not apply every fault
+manifest together because each scenario is intended to be isolated.
+
+### CrashLoopBackOff / ApplicationCrash
+
+The container exits with code 1 and eventually enters CrashLoopBackOff.
 
 ```bash
 kubectl apply -f k8s/broken-deployment.yaml
+kubectl get pods -l app=broken-service -w
 ```
 
-This creates a pod that immediately exits with code 1, causing Kubernetes to enter a **CrashLoopBackOff** cycle. After 3+ restarts (roughly 1–2 minutes), the daemon will detect the anomaly.
+### ConfigError
+
+The deployment references the missing `mongo-config` ConfigMap, so the pod
+should report CreateContainerConfigError.
+
+```bash
+kubectl apply -f k8s/configerror-deployment.yaml
+kubectl get pods -l app=mongodb -w
+kubectl describe pod -l app=mongodb
+```
+
+### Missing Secret / ConfigError
+
+The deployment references the missing `db-credentials` Secret, so the pod
+should fail during container configuration.
+
+```bash
+kubectl apply -f k8s/missingsecret-deployment.yaml
+kubectl get pods -l app=mongodb-secret -w
+kubectl describe pod -l app=mongodb-secret
+```
+
+### ImagePullError
+
+The manifest uses a deliberately nonexistent nginx image tag.
+
+```bash
+kubectl apply -f k8s/imagepullerror-deployment.yaml
+kubectl get pods -l app=image-pull-error -w
+kubectl describe pod -l app=image-pull-error
+```
+
+### OOMKilled
+
+The application exceeds its 100 MiB memory limit. The daemon should detect
+OOMKilled and increase the owning Deployment's memory limit by 25 percent.
+
+```bash
+kubectl apply -f k8s/oom-deployment.yaml
+kubectl get pods -l app=oom-service -w
+kubectl logs -f deployment/oom-service
+```
+
+After detection, verify the remediation:
+
+```bash
+kubectl get deployment oom-service \
+  -o jsonpath="{.spec.template.spec.containers[0].resources.limits.memory}"
+```
+
+### CPUThrottle
+
+The container has a 50 millicore CPU limit. The daemon compares metrics-server
+usage against that limit after three consecutive high-usage polls.
+
+```bash
+kubectl apply -f k8s/cputhrottle-deployment.yaml
+kubectl get pods -l app=cputhrottle-service -w
+kubectl top pod -l app=cputhrottle-service
+```
+
+The deployment comments also reference these Prometheus counters for manual
+investigation:
+
+```text
+container_cpu_cfs_throttled_periods_total
+container_cpu_cfs_periods_total
+```
+
+### NetworkLatency
+
+Apply the nginx service first, wait until its pod is ready, and then apply the
+separate NetworkChaos manifest. Applying the chaos resource before the target
+pod exists can result in `Failed to select targets: no pod is selected`.
+
+```bash
+kubectl apply -f k8s/networklatency-deployment.yaml
+kubectl wait --for=condition=ready pod -l app=nginx --timeout=120s
+kubectl apply -f k8s/networklatency-creater.yaml
+```
+
+Verify that Chaos Mesh selected and injected the delay:
+
+```bash
+kubectl describe networkchaos chaos-creater -n default
+kubectl get networkchaos chaos-creater -n default \
+  -o jsonpath="{range .status.conditions[*]}{.type}={.status}{'\n'}{end}"
+kubectl get networkchaos chaos-creater -n default \
+  -o jsonpath="{.status.experiment.containerRecords[0].phase}{'\n'}"
+```
+
+The expected state is `Selected=True`, `AllInjected=True`, and phase
+`Injected`. To manually measure the service from inside the cluster:
+
+```bash
+kubectl run tmp-curl --rm -it --image=curlimages/curl:8.10.1 \
+  --restart=Never -- curl -o /dev/null -sS \
+  -w "latency=%{time_total}s\n" \
+  http://nginx-service.default.svc.cluster.local
+```
 
 ---
 
-## 9. What to Expect
+## 10. What to Expect
 
-Once the daemon detects the CrashLoopBackOff pod:
+Once the daemon detects a fault:
 
 1. It collects pod logs, restart counts, and Kubernetes warning events.
 2. It sends all signals to **Gemini** for analysis.
@@ -185,13 +296,20 @@ Example terminal output:
 
 ---
 
-## 10. Clean Up
+## 11. Clean Up
 
 ```bash
-# Remove the broken deployment
+# Remove any scenario that is still deployed
 kubectl delete -f k8s/broken-deployment.yaml
+kubectl delete -f k8s/configerror-deployment.yaml
+kubectl delete -f k8s/missingsecret-deployment.yaml
+kubectl delete -f k8s/imagepullerror-deployment.yaml
+kubectl delete -f k8s/oom-deployment.yaml
+kubectl delete -f k8s/cputhrottle-deployment.yaml
+kubectl delete -f k8s/networklatency-creater.yaml
+kubectl delete -f k8s/networklatency-deployment.yaml
 
-# Remove sample apps
+# Remove the healthy baseline
 kubectl delete -f k8s/sample-app.yaml
 
 # Uninstall Prometheus (if installed)
@@ -209,7 +327,7 @@ minikube delete
 
 ---
 
-## Project Structure
+## 12. Project Structure
 
 ```
 self-healing-daemon/
@@ -222,7 +340,14 @@ self-healing-daemon/
 ├── requirements.txt       # All pip dependencies
 ├── .env.example           # Template for environment variables
 ├── k8s/
-│   ├── broken-deployment.yaml   # Test fault: CrashLoopBackOff
-│   └── sample-app.yaml          # Healthy 2-pod sample application
+│   ├── broken-deployment.yaml          # ApplicationCrash
+│   ├── configerror-deployment.yaml     # Missing ConfigMap
+│   ├── cputhrottle-deployment.yaml     # CPUThrottle
+│   ├── imagepullerror-deployment.yaml  # ImagePullError
+│   ├── missingsecret-deployment.yaml   # Missing Secret
+│   ├── networklatency-creater.yaml     # Chaos Mesh NetworkChaos
+│   ├── networklatency-deployment.yaml  # nginx target service
+│   ├── oom-deployment.yaml              # OOMKilled
+│   └── sample-app.yaml                  # Healthy baseline apps
 └── README.md              # This file
 ```
