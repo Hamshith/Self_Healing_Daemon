@@ -6,3 +6,5 @@ python-dotenv
 pydantic
 fastapi
 uvicorn
+chromadb
+sentence-transformers

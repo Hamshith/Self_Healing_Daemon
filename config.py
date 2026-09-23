@@ -35,6 +35,7 @@ LOG_LINES = 50  # last N lines of pod logs to collect
 
 # ── Incident Storage ────────────────────────────────────
 INCIDENTS_DIR = "./incidents"
+REPORTS_DIR = "./reports"
 DB_PATH = "./incidents.db"
 
 # ── LLM (Google Gemini) ────────────────────────────────
