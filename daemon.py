@@ -117,7 +117,10 @@ async def _poll_cycle():
                             f"NetworkChaos '{anomaly.get('chaos_name')}' is "
                             f"actively injecting delay against target app "
                             f"{target_app or pod_name} and selector "
-                            f"{anomaly.get('target_selector', {})}"
+                            f"{anomaly.get('target_selector', {})}. "
+                            f"In-cluster request latency measured "
+                            f"{anomaly.get('measured_latency_ms')} ms "
+                            f"(threshold: {anomaly.get('latency_threshold_ms')} ms)."
                         ),
                         "timestamp": anomaly.get("detected_at"),
                         "type": "Warning",

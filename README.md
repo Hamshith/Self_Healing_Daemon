@@ -88,6 +88,25 @@ helm install chaos-mesh chaos-mesh/chaos-mesh -n=chaos-mesh --create-namespace -
 
 > **Note:** Prometheus is optional. The daemon falls back to the Kubernetes API if Prometheus is not reachable.
 
+For NetworkChaos detection, start the nginx deployment first and then apply
+`k8s/networklatency-creater.yaml`. The daemon creates a short-lived curl pod
+inside the cluster and measures the configured service URL. It reports
+`NetworkLatency` only when Chaos Mesh reports `AllInjected=True` and the
+measured latency is at least `NETWORK_LATENCY_THRESHOLD_MS` (250 ms by
+default).
+
+These settings can be overridden in `.env`:
+
+```text
+NETWORK_LATENCY_TARGET_URL=http://nginx-service.default.svc.cluster.local
+NETWORK_LATENCY_THRESHOLD_MS=250
+NETWORK_LATENCY_PROBE_IMAGE=curlimages/curl:8.10.1
+NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS=10
+```
+
+The Kubernetes identity running the daemon needs permission to create, read,
+exec into, and delete pods in the probe namespace.
+
 ---
 
 ## 6. Deploy Sample Apps

@@ -7,7 +7,7 @@ Identifies pods exhibiting any of 7 fault types:
   4. ConfigError           - CreateContainerConfigError (missing secret/configmap)
   5. PendingScheduling    - pod stuck Pending > 5 minutes
   6. CPUThrottle           - container CPU usage pinned at its limit (via metrics-server)
-  7. NetworkLatency        - Chaos Mesh NetworkChaos CR is currently injecting delay
+    7. NetworkLatency        - measured in-cluster HTTP latency exceeds the threshold
 
 Faults 1-5 come from pod container status and are cheap to check on
 every poll. Faults 6-7 need different data sources (the metrics API
@@ -15,8 +15,11 @@ and the Chaos Mesh CRD), so they live in a separate function that
 daemon.py should call alongside detect_anomalies().
 """
 
+import time
+import uuid
 from datetime import datetime, timezone
 from kubernetes import client, config as k8s_config
+from kubernetes.stream import stream
 import config
 
 PENDING_THRESHOLD_SECONDS = 5 * 60      # 5 minutes
@@ -27,7 +30,6 @@ CPU_THROTTLE_RATIO = 0.95                # usage/limit ratio considered "throttl
 _previously_flagged: dict = {}        # "namespace/pod" -> (fault_type, restart_count)
 _cpu_throttle_streak: dict = {}       # "namespace/pod/container" -> consecutive at-limit count
 _previously_flagged_cpu: set = set()
-_previously_flagged_network: set = set()
 
 
 def _load_kube_config():
@@ -292,16 +294,97 @@ def _detect_cpu_throttle(v1) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────
-# Fault 7: NetworkLatency  (via Chaos Mesh NetworkChaos CRD status)
+# Fault 7: NetworkLatency  (Chaos Mesh status plus in-cluster HTTP probe)
 # ─────────────────────────────────────────────────────────────────
+
+def _measure_http_latency(v1, target_url: str, namespace: str = "default") -> float:
+    """Measure an HTTP request from a temporary in-cluster curl pod."""
+    pod_name = f"latency-probe-{uuid.uuid4().hex[:8]}"
+    pod = client.V1Pod(
+        metadata=client.V1ObjectMeta(
+            name=pod_name,
+            labels={"app": "self-healing-latency-probe"},
+        ),
+        spec=client.V1PodSpec(
+            restart_policy="Never",
+            containers=[client.V1Container(
+                name="curl",
+                image=config.NETWORK_LATENCY_PROBE_IMAGE,
+                command=["sh", "-c", "sleep 60"],
+            )],
+        ),
+    )
+
+    try:
+        v1.create_namespaced_pod(namespace=namespace, body=pod)
+        deadline = time.monotonic() + config.NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS
+        last_status = "Unknown"
+        while time.monotonic() < deadline:
+            current = v1.read_namespaced_pod(name=pod_name, namespace=namespace)
+            last_status = current.status.phase or "Unknown"
+            if current.status.phase == "Running":
+                break
+            if current.status.phase in ("Failed", "Succeeded"):
+                reasons = []
+                for container_status in current.status.container_statuses or []:
+                    state = container_status.state
+                    if state and state.waiting:
+                        reasons.append(
+                            f"{container_status.name}: {state.waiting.reason}"
+                        )
+                    elif state and state.terminated:
+                        reasons.append(
+                            f"{container_status.name}: {state.terminated.reason}"
+                        )
+                detail = ", ".join(reasons) or "no container reason"
+                raise RuntimeError(
+                    f"latency probe pod ended in {current.status.phase} ({detail})"
+                )
+            time.sleep(0.5)
+        else:
+            reasons = []
+            for container_status in current.status.container_statuses or []:
+                state = container_status.state
+                if state and state.waiting:
+                    reasons.append(f"{container_status.name}: {state.waiting.reason}")
+            detail = ", ".join(reasons) or "check pod events"
+            raise TimeoutError(
+                f"latency probe pod did not become ready; phase={last_status}, {detail}"
+            )
+
+        output = stream(
+            v1.connect_get_namespaced_pod_exec,
+            pod_name,
+            namespace,
+            command=[
+                "curl", "-sS", "-o", "/dev/null",
+                "-w", "%{time_total}",
+                "--max-time", str(config.NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS),
+                target_url,
+            ],
+            container="curl",
+            stderr=True,
+            stdin=False,
+            stdout=True,
+            tty=False,
+        )
+        return float(output.strip()) * 1000
+    finally:
+        try:
+            v1.delete_namespaced_pod(
+                name=pod_name,
+                namespace=namespace,
+                body=client.V1DeleteOptions(grace_period_seconds=0),
+            )
+        except Exception:
+            pass
 
 def _detect_network_latency(custom_api, v1=None) -> list:
     """
-    Queries Chaos Mesh's NetworkChaos custom resources and flags any
-    that are currently in an injecting/active delay state for a live
-    target app. This checks both the CRD status and the actual pods
-    selected by the NetworkChaos spec, so we only report latency when
-    it is actively affecting a real application object.
+    Queries Chaos Mesh's NetworkChaos resources and measures the target
+    service from a temporary in-cluster curl pod. A fault is reported
+    only when Chaos Mesh is injecting delay and measured latency exceeds
+    NETWORK_LATENCY_THRESHOLD_MS.
 
     This matches the repo's use case: a NetworkChaos resource targeting
     pods labeled `app: nginx` should be reported as NetworkLatency only
@@ -327,8 +410,6 @@ def _detect_network_latency(custom_api, v1=None) -> list:
         print(f"[detector] Error listing pods for NetworkLatency target match: {exc}")
         pods = None
 
-    seen_this_poll = set()
-
     for item in chaos_objs.get("items", []):
         name = item["metadata"]["name"]
         namespace = item["metadata"]["namespace"]
@@ -338,7 +419,6 @@ def _detect_network_latency(custom_api, v1=None) -> list:
             continue
 
         key = f"{namespace}/{name}"
-        seen_this_poll.add(key)
 
         selector = spec.get("selector", {})
         target_app = None
@@ -375,30 +455,39 @@ def _detect_network_latency(custom_api, v1=None) -> list:
 
         status = item.get("status", {})
         conditions = status.get("conditions", [])
+        experiment = status.get("experiment", {}) or {}
+        observed_phase = (
+            status.get("phase")
+            or experiment.get("phase")
+            or experiment.get("observedPhase")
+        )
 
         is_injecting = any(
-            c.get("type") == "AllInjected" and c.get("status") == "True"
+            c.get("type") == "AllInjected" and str(c.get("status")).lower() == "true"
             for c in conditions
-        )
-        if not conditions:
-            experiment = status.get("experiment", {})
-            observed_phase = (
-                status.get("phase")
-                or experiment.get("phase")
-                or experiment.get("observedPhase")
-            )
-            is_injecting = observed_phase in ("Run", "Running")
+        ) or observed_phase in ("Run", "Running")
 
         if is_injecting and (not selected_pods):
             # Keep the alarm only if the target app is actually present.
             # A CR that exists but selects no live pods is not a real app latency incident.
             is_injecting = False
 
+        measured_latency_ms = None
         if is_injecting:
-            if key in _previously_flagged_network:
-                continue
-            _previously_flagged_network.add(key)
+            try:
+                measured_latency_ms = _measure_http_latency(
+                    v1,
+                    config.NETWORK_LATENCY_TARGET_URL,
+                    namespace,
+                )
+                is_injecting = (
+                    measured_latency_ms >= config.NETWORK_LATENCY_THRESHOLD_MS
+                )
+            except Exception as exc:
+                print(f"[detector] Latency probe failed for {name}: {exc}")
+                is_injecting = False
 
+        if is_injecting:
             anomalies.append(
                 {
                     "chaos_name": name,
@@ -407,15 +496,12 @@ def _detect_network_latency(custom_api, v1=None) -> list:
                     "target_app": target_app,
                     "target_pods": selected_pods,
                     "target_selector": selector,
+                    "target_url": config.NETWORK_LATENCY_TARGET_URL,
+                    "measured_latency_ms": round(measured_latency_ms, 2),
+                    "latency_threshold_ms": config.NETWORK_LATENCY_THRESHOLD_MS,
                     "detected_at": datetime.utcnow().isoformat() + "Z",
                 }
             )
-        else:
-            _previously_flagged_network.discard(key)
-
-    for key in list(_previously_flagged_network):
-        if key not in seen_this_poll:
-            _previously_flagged_network.discard(key)
 
     return anomalies
 
