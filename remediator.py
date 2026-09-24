@@ -5,18 +5,12 @@ Given an (incident, diagnosis) pair produced by detector.py + llm_client.py,
 decide whether to auto-remediate and, if so, execute a real action against
 the cluster via the Kubernetes Python client.
 
-Decision tree:
-    ImagePullError    -> escalate only (can't fix a bad tag automatically)
-    OOMKilled         -> patch the owning Deployment's memory limit +25%
-    ApplicationCrash  -> delete the pod (K8s recreates it cleanly)
-    ConfigError       -> escalate only
-    anything else     -> escalate only
+The LLM returns an ordered remediation_steps list. The remediator executes
+only the small allow-list of Kubernetes operations implemented below; free-form
+commands from the LLM are never passed to a shell.
 
 Hard rule: nothing executes unless diagnosis["safe_to_auto_remediate"] is
-True. Even for OOMKilled / ApplicationCrash, if that flag is False, we
-escalate instead. Currently llm_client's prompt always asks for this flag,
-but until the prompt is tuned to return True for high-confidence cases,
-everything will escalate -- that is expected, not a bug.
+True and the diagnosis contains valid remediation steps.
 
 Rollback (roadmap Phase 2 Step 4):
     Before executing any action we snapshot enough state to undo it, and
@@ -187,6 +181,48 @@ def _escalate(incident: dict, diagnosis: dict, reason: str) -> dict:
     }
     print(f"[remediator] ESCALATE {incident.get('pod_name')}: {reason}")
     return result
+
+
+def _run_remediation_step(incident: dict, diagnosis: dict, step: dict) -> dict:
+    """Execute one validated LLM step through an internal action handler."""
+    action = step.get("action")
+    parameters = step.get("parameters") or {}
+    print(
+        f"[remediator] Executing LLM step {step.get('step', '?')}: "
+        f"action={action}"
+    )
+
+    if action == "delete_pod":
+        return _delete_pod(incident, diagnosis)
+    if action == "increase_memory_limit":
+        increase_pct = parameters.get("increase_pct", 0.25)
+        if not isinstance(increase_pct, (int, float)) or not 0 < increase_pct <= 1:
+            return {
+                "action_taken": action,
+                "success": False,
+                "status": "failed",
+                "reason": "increase_pct must be a number greater than 0 and at most 1.",
+                "pod_name": incident.get("pod_name"),
+                "namespace": incident.get("namespace"),
+                "rollback_path": None,
+            }
+        return _patch_memory_limit(incident, diagnosis, increase_pct=increase_pct)
+    if action == "escalate":
+        return _escalate(
+            incident,
+            diagnosis,
+            step.get("reason", "The LLM requested human intervention."),
+        )
+
+    return {
+        "action_taken": action or "unknown",
+        "success": False,
+        "status": "failed",
+        "reason": f"Unsupported remediation action: {action!r}",
+        "pod_name": incident.get("pod_name"),
+        "namespace": incident.get("namespace"),
+        "rollback_path": None,
+    }
 
 
 def _delete_pod(incident: dict, diagnosis: dict) -> dict:
@@ -457,45 +493,35 @@ def remediate(incident: dict, diagnosis: dict) -> dict:
         pod_name, namespace
         rollback_path: str | None
     """
-    category = diagnosis.get("root_cause_category")
     safe = diagnosis.get("safe_to_auto_remediate", False)
-    verified_oom = (
-        incident.get("fault_type") == "OOMKilled"
-        and category == "OOMKilled"
+    steps = diagnosis.get("remediation_steps")
+    print(
+        f"[remediator] Routing diagnosis: category={diagnosis.get('root_cause_category')} "
+        f"safe={safe} steps={len(steps) if isinstance(steps, list) else 0}"
     )
 
-    # Hard gate: nothing below this line executes a real action unless
-    # both the category maps to an auto-remediable case AND the LLM
-    # explicitly said it's safe.
-    if not safe and not verified_oom:
+    if not safe:
         return _escalate(
             incident, diagnosis,
-            reason=(
-                f"safe_to_auto_remediate is False for category "
-                f"'{category}' -- escalating rather than acting."
-            ),
+            reason="safe_to_auto_remediate is False -- escalating rather than acting.",
         )
 
-    if category == "ImagePullError":
+    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
         return _escalate(
             incident, diagnosis,
-            reason="ImagePullError cannot be auto-fixed (bad tag requires a human).",
+            reason="LLM did not provide a valid remediation_steps list.",
         )
 
-    elif category == "OOMKilled":
-        return _patch_memory_limit(incident, diagnosis)
+    step_results = []
+    for step in sorted(steps, key=lambda item: item.get("step", 0)):
+        result = _run_remediation_step(incident, diagnosis, step)
+        step_results.append({"step": step.get("step"), **result})
+        if not result.get("success") or result.get("status") == "escalated":
+            result["steps"] = step_results
+            return result
 
-    elif category == "ApplicationCrash":
-        return _delete_pod(incident, diagnosis)
-
-    elif category == "ConfigError":
-        return _escalate(
-            incident, diagnosis,
-            reason="ConfigError requires a human to supply the missing config/secret.",
-        )
-
-    else:
-        return _escalate(
-            incident, diagnosis,
-            reason=f"No auto-remediation defined for category '{category}'.",
-        )
+    final_result = step_results[-1].copy()
+    final_result["steps"] = step_results
+    final_result["action_taken"] = "multiple_steps" if len(step_results) > 1 else final_result["action_taken"]
+    final_result["reason"] = "All LLM remediation steps completed successfully."
+    return final_result

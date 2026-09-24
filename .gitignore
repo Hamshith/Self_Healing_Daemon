@@ -9,3 +9,8 @@ frontend/dist/
 incidents.db
 /rollbacks/
 /rollbacks/*
+IMPLEMENTATION_NOTES.md
+/.chroma/
+/.chroma/*
+/reports/
+/reports/*

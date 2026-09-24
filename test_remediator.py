@@ -32,7 +32,7 @@ class RemediatorTests(unittest.TestCase):
             loaded = json.load(fh)
         self.assertEqual(loaded["namespace"], "demo-ns")
 
-    def test_verified_oom_is_patched_when_llm_safe_flag_is_false(self):
+    def test_llm_steps_select_memory_patch(self):
         incident = {
             "pod_name": "oom-pod",
             "namespace": "default",
@@ -40,7 +40,12 @@ class RemediatorTests(unittest.TestCase):
         }
         diagnosis = {
             "root_cause_category": "OOMKilled",
-            "safe_to_auto_remediate": False,
+            "safe_to_auto_remediate": True,
+            "remediation_steps": [{
+                "step": 1,
+                "action": "increase_memory_limit",
+                "parameters": {"increase_pct": 0.25},
+            }],
         }
 
         with patch.object(remediator, "_patch_memory_limit", return_value={
@@ -48,8 +53,21 @@ class RemediatorTests(unittest.TestCase):
         }) as patch_memory:
             result = remediator.remediate(incident, diagnosis)
 
-        patch_memory.assert_called_once_with(incident, diagnosis)
+        patch_memory.assert_called_once_with(incident, diagnosis, increase_pct=0.25)
         self.assertEqual(result["status"], "remediated")
+
+    def test_safe_false_does_not_execute_llm_steps(self):
+        incident = {"pod_name": "oom-pod", "namespace": "default"}
+        diagnosis = {
+            "safe_to_auto_remediate": False,
+            "remediation_steps": [{"step": 1, "action": "delete_pod"}],
+        }
+
+        with patch.object(remediator, "_delete_pod") as delete_pod:
+            result = remediator.remediate(incident, diagnosis)
+
+        delete_pod.assert_not_called()
+        self.assertEqual(result["status"], "escalated")
 
 
 if __name__ == "__main__":

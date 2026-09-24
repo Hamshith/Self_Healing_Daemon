@@ -46,6 +46,7 @@ def _check_prometheus() -> bool:
 
 def _startup_checks():
     """Run pre-flight checks; exit on fatal issues."""
+    print("[daemon] Starting pre-flight checks")
     if not config.GEMINI_API_KEY:
         print("\033[91m[FATAL] GEMINI_API_KEY is not set.\033[0m")
         print("Copy .env.example to .env and add your API key.")
@@ -68,6 +69,7 @@ def _startup_checks():
         model=config.MODEL,
         prom=prom_status,
     ))
+    print("[daemon] Pre-flight checks complete")
 
 
 async def _poll_cycle():
@@ -244,6 +246,7 @@ async def main():
     """Daemon main loop."""
     _startup_checks()
     db.init_db()
+    print("[daemon] SQLite database initialized")
     print("Daemon started. Press Ctrl+C to stop.\n")
 
     try:

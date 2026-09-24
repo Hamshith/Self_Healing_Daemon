@@ -42,3 +42,7 @@ DB_PATH = "./incidents.db"
 MODEL = "gemini-2.5-flash"
 MAX_TOKENS = 4096
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# ── Hugging Face (runbook embeddings) ──────────────────
+HF_TOKEN = os.getenv("HF_TOKEN")
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "8"))

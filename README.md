@@ -2,6 +2,13 @@
 
 A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Kubernetes failure modes, measures real in-cluster network latency, and leverages **Google Gemini** to diagnose incidents automatically.
 
+Gemini returns an ordered `remediation_steps` list with an allow-listed action
+for each step. The remediator executes only supported Kubernetes operations
+(`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is
+true; human-only work is returned as `escalate`. The matching runbook in
+`runbooks/` defines the investigation and remediation sequence supplied to
+Gemini.
+
 ---
 
 ## 1. Prerequisites
@@ -39,6 +46,8 @@ copy .env.example .env      # Windows
 
 # Edit .env and paste your Gemini API key
 # GEMINI_API_KEY=AIza...
+# Add a Hugging Face read token to avoid anonymous Hub rate limits
+# HF_TOKEN=hf_...
 ```
 
 ---
@@ -275,8 +284,8 @@ Once the daemon detects a fault:
 1. It collects pod logs, restart counts, and Kubernetes warning events.
 2. It sends all signals to **Gemini** for analysis.
 3. A colour-coded **Incident Diagnosis Report** is printed to the terminal showing:
-   - Root cause and category
-   - Confidence and severity
+  - LLM-derived error, root cause, and category
+  - Confidence and evidence-derived severity
    - Evidence (specific log lines / events)
    - Recommended remediation command
 4. The report is saved as a timestamped JSON file in the `incidents/` directory.

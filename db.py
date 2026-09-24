@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS incidents (
     fault_type              TEXT,
     restart_count           INTEGER,
     detected_at             TEXT,
+    diagnosed_error         TEXT,
     root_cause              TEXT,
     root_cause_category     TEXT,
     severity                TEXT,
@@ -75,6 +76,11 @@ def init_db():
     conn = _get_conn()
     try:
         conn.executescript(_SCHEMA)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(incidents)").fetchall()
+        }
+        if "diagnosed_error" not in columns:
+            conn.execute("ALTER TABLE incidents ADD COLUMN diagnosed_error TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -132,10 +138,10 @@ def save_incident(incident_data: dict, diagnosis: dict) -> int:
             """
             INSERT INTO incidents (
                 pod_name, namespace, fault_type, restart_count, detected_at,
-                root_cause, root_cause_category, severity, confidence,
+                diagnosed_error, root_cause, root_cause_category, severity, confidence,
                 recommended_action, safe_to_auto_remediate,
                 raw_incident_json, raw_diagnosis_json, saved_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 incident_data.get("pod_name"),
@@ -143,6 +149,7 @@ def save_incident(incident_data: dict, diagnosis: dict) -> int:
                 incident_data.get("fault_type"),
                 incident_data.get("restart_count"),
                 incident_data.get("detected_at"),
+                diagnosis.get("error") or diagnosis.get("root_cause"),
                 diagnosis.get("root_cause"),
                 diagnosis.get("root_cause_category"),
                 diagnosis.get("severity"),

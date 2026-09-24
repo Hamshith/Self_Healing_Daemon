@@ -58,6 +58,7 @@ def print_incident_report(incident_data, diagnosis):
 
     print(f"{_CYAN}╠{'═'*60}╣{_RESET}")
     print(f"{P}  {_BOLD}{'Root Cause':<18}{_RESET}{diagnosis.get('root_cause','N/A')}")
+    print(f"{P}  {_BOLD}{'Diagnosed Error':<18}{_RESET}{diagnosis.get('error', diagnosis.get('root_cause','N/A'))}")
     print(f"{P}  {_BOLD}{'Category':<18}{_RESET}{diagnosis.get('root_cause_category','N/A')}")
     print(f"{P}  {_BOLD}{'Confidence':<18}{_RESET}{diagnosis.get('confidence','N/A')}")
     print(f"{P}  {_BOLD}{'Severity':<18}{_RESET}{_colorize(sev)}")

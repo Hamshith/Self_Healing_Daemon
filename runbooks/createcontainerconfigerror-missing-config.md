@@ -5,3 +5,11 @@ CreateContainerConfigError occurs before the container starts when Kubernetes ca
 Create or restore the required object using a controlled manifest, or patch the workload to reference the correct name and key. Avoid placing credentials directly in a Deployment manifest or command line. Restart the rollout after correcting the reference and verify the object exists in the same namespace.
 
 Apply/remove: apply `k8s/missingsecret-deployment.yaml` to reproduce; remove it with `kubectl delete -f k8s/missingsecret-deployment.yaml`.
+
+## Remediation steps
+1. Inspect Events and identify the missing object name and key.
+2. Verify the object in the workload namespace without exposing secret values.
+3. Return `escalate` with the required approved manifest or reference correction.
+4. After the human change, restart the rollout and verify the pod starts successfully.
+
+An isolated auxiliary pod can wait for the approved configuration owner, but a missing object blocking all replicas or exposing a credential risk requires immediate escalation.

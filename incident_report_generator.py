@@ -50,6 +50,8 @@ def generate_report(incident: dict, diagnosis: dict, remediation: dict | None = 
 
 **Root cause:** {diagnosis_data.get('root_cause', 'unknown')}
 
+**Diagnosed error:** {diagnosis_data.get('error', diagnosis_data.get('root_cause', 'unknown'))}
+
 **Category:** {diagnosis_data.get('root_cause_category', 'unknown')}  
 **Confidence:** {diagnosis_data.get('confidence', 'unknown')}  
 **Severity:** {diagnosis_data.get('severity', 'unknown')}
@@ -66,6 +68,20 @@ def generate_report(incident: dict, diagnosis: dict, remediation: dict | None = 
 - **Auto-remediation allowed:** {diagnosis_data.get('safe_to_auto_remediate', False)}
 - **Action taken:** {action.get('action', 'none')}
 - **Outcome:** {action.get('message', action.get('status', 'not attempted'))}
+
+### LLM Remediation Steps
+
+{_list([
+    f"Step {step.get('step', index)}: {step.get('action', 'unknown')} - {step.get('reason', '')}"
+    for index, step in enumerate(diagnosis_data.get('remediation_steps', []), start=1)
+])}
+
+### Step Results
+
+{_list([
+    f"Step {step.get('step', index)}: {step.get('status', 'unknown')} - {step.get('reason', '')}"
+    for index, step in enumerate(action.get('steps', []), start=1)
+])}
 
 ## Prevention Recommendations
 
