@@ -1,16 +1,52 @@
+# ── Secrets & environment ──────────────────────────────────────────────────
 .env
-/incidents/
-/incidents/*
+
+# ── Python runtime ─────────────────────────────────────────────────────────
 __pycache__/
-__pycache__/*
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ─────────────────────────────────────────────────────
 venv/
+.venv/
+
+# ── IDE / editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Kubernetes / daemon runtime output ──────────────────────────────────────
+/incidents/
+/rollbacks/
+/reports/
+incidents.db
+
+# ── ChromaDB vector store ───────────────────────────────────────────────────
+/.chroma/
+
+# ── Frontend build ──────────────────────────────────────────────────────────
 frontend/node_modules/
 frontend/dist/
-incidents.db
-/rollbacks/
-/rollbacks/*
+frontend/.env
+
+# ── Evaluation results (JSONL run outputs — can be large) ──────────────────
+# The .gitkeep file inside each directory IS committed so the directory
+# structure is preserved in the repo without committing run data.
+eval/results/*.jsonl
+eval/results/*.json
+!eval/results/.gitkeep
+
+# ── Safety probe run outputs ────────────────────────────────────────────────
+eval/results/safety_probe*.jsonl
+eval/results/safety_probe*_summary.json
+
+# ── ML model artefacts (if saved to disk in future) ────────────────────────
+eval/results/*.pkl
+eval/results/*.joblib
+
+# ── Miscellaneous ───────────────────────────────────────────────────────────
 IMPLEMENTATION_NOTES.md
-/.chroma/
-/.chroma/*
-/reports/
-/reports/*
+*.log

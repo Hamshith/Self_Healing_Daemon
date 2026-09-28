@@ -25,11 +25,14 @@ import json
 import os
 import re
 from datetime import datetime
+from typing import Optional
 
 from kubernetes import client, config as k8s_config
 from kubernetes.client.exceptions import ApiException
 
 import config
+import safety_layer as sl
+from safety_layer import SafetyVeto, SafetyEventType, SafetyEvent, record_events
 
 
 ROLLBACK_DIR = "rollbacks"
@@ -183,42 +186,60 @@ def _escalate(incident: dict, diagnosis: dict, reason: str) -> dict:
     return result
 
 
-def _run_remediation_step(incident: dict, diagnosis: dict, step: dict) -> dict:
-    """Execute one validated LLM step through an internal action handler."""
-    action = step.get("action")
-    parameters = step.get("parameters") or {}
+def _run_remediation_step(incident: dict, diagnosis: dict, step: dict,
+                          incident_id: Optional[int] = None) -> dict:
+    """
+    Validate one LLM remediation step through Layers 2 and 3 of the safety
+    gate, then dispatch to the appropriate action handler.
+
+    Any Layer-2 (allow-list) or Layer-3 (parameter schema) violation is
+    recorded as a SafetyEvent in the database and converted to an escalation
+    result — no Kubernetes API call is made.
+    """
     print(
-        f"[remediator] Executing LLM step {step.get('step', '?')}: "
-        f"action={action}"
+        f"[remediator] Evaluating LLM step {step.get('step', '?')} "
+        f"proposed_action={step.get('action')!r}"
     )
+
+    try:
+        action, params, info_events = sl.validate_step(step, incident, incident_id)
+        record_events(info_events)
+    except SafetyVeto as veto:
+        record_events(veto.events)
+        reasons = "; ".join(e.veto_reason for e in veto.events)
+        print(f"[remediator][SAFETY VETO] Layer {veto.events[0].layer}: {reasons}")
+        return {
+            "action_taken": step.get("action") or "unknown",
+            "success": False,
+            "status": "safety_vetoed",
+            "reason": f"Safety gate blocked this action: {reasons}",
+            "pod_name": incident.get("pod_name"),
+            "namespace": incident.get("namespace"),
+            "rollback_path": None,
+            "safety_events": [e.to_dict() for e in veto.events],
+        }
+
+    print(f"[remediator] Executing validated step: action={action}")
 
     if action == "delete_pod":
         return _delete_pod(incident, diagnosis)
     if action == "increase_memory_limit":
-        increase_pct = parameters.get("increase_pct", 0.25)
-        if not isinstance(increase_pct, (int, float)) or not 0 < increase_pct <= 1:
-            return {
-                "action_taken": action,
-                "success": False,
-                "status": "failed",
-                "reason": "increase_pct must be a number greater than 0 and at most 1.",
-                "pod_name": incident.get("pod_name"),
-                "namespace": incident.get("namespace"),
-                "rollback_path": None,
-            }
-        return _patch_memory_limit(incident, diagnosis, increase_pct=increase_pct)
+        increase_pct = params.get("increase_pct", 0.25)
+        return _patch_memory_limit(incident, diagnosis, increase_pct=float(increase_pct))
     if action == "escalate":
         return _escalate(
             incident,
             diagnosis,
-            step.get("reason", "The LLM requested human intervention."),
+            step.get("reason", params.get("reason", "The LLM requested human intervention.")),
         )
 
+    # Should never reach here — validate_step would have raised SafetyVeto.
+    # Defensive fallback just in case.
     return {
-        "action_taken": action or "unknown",
+        "action_taken": action,
         "success": False,
         "status": "failed",
-        "reason": f"Unsupported remediation action: {action!r}",
+        "reason": f"Unexpected action reached dispatch after validation: {action!r}",
         "pod_name": incident.get("pod_name"),
         "namespace": incident.get("namespace"),
         "rollback_path": None,
@@ -474,41 +495,55 @@ def rollback_action(rollback_path: str) -> dict:
 # Public entry point -- call this from daemon.py
 # ─────────────────────────────────────────────────────────────
 
-def remediate(incident: dict, diagnosis: dict) -> dict:
+def remediate(incident: dict, diagnosis: dict,
+              incident_id: Optional[int] = None) -> dict:
     """
     Decide what to do with a diagnosed incident and (maybe) do it.
 
-    This is the single function daemon.py should call, right after
-    llm_client.diagnose_incident(). Example wiring (add to daemon.py's
-    _poll_cycle, after the diagnosis try/except block):
+    Passes every LLM step through the five safety layers before any
+    Kubernetes API call is made.  Safety events are persisted to the
+    database so interception rates can be reported in the paper.
 
-        try:
-            remediation = remediator.remediate(incident, diagnosis)
-        except Exception as exc:
-            print(f"[daemon] Error remediating {pod}: {exc}")
-            remediation = None
+    incident_id: the DB row id of this incident (from reporter.save_incident_report).
+                 Pass it through so safety events are linked to the incident row.
 
     Returns a result dict always containing at least:
-        action_taken: "escalate" | "delete_pod" | "patch_memory"
+        action_taken: str
         success: bool
         reason: str
         pod_name, namespace
         rollback_path: str | None
     """
-    safe = diagnosis.get("safe_to_auto_remediate", False)
+    pod_name  = incident.get("pod_name", "unknown")
+    namespace = incident.get("namespace", "default")
+    safe  = diagnosis.get("safe_to_auto_remediate", False)
     steps = diagnosis.get("remediation_steps")
     print(
         f"[remediator] Routing diagnosis: category={diagnosis.get('root_cause_category')} "
         f"safe={safe} steps={len(steps) if isinstance(steps, list) else 0}"
     )
 
+    # ── Layer 1: safe_to_auto_remediate guard ─────────────────────────────
     if not safe:
+        # Record a Layer-1 event so we can count how often the LLM itself
+        # flagged an incident as unsafe (correct behaviour) vs how often
+        # the guard had to step in.
+        event = SafetyEvent(
+            event_type=SafetyEventType.UNSAFE_AUTO_REMEDIATE,
+            incident_id=incident_id,
+            pod_name=pod_name,
+            namespace=namespace,
+            proposed_action="(any)",
+            veto_reason="safe_to_auto_remediate=False — no automatic action taken.",
+            layer=1,
+        )
+        record_events([event])
         return _escalate(
             incident, diagnosis,
             reason="safe_to_auto_remediate is False -- escalating rather than acting.",
         )
 
-    if not isinstance(steps, list) or not steps or not all(isinstance(step, dict) for step in steps):
+    if not isinstance(steps, list) or not steps or not all(isinstance(s, dict) for s in steps):
         return _escalate(
             incident, diagnosis,
             reason="LLM did not provide a valid remediation_steps list.",
@@ -516,14 +551,16 @@ def remediate(incident: dict, diagnosis: dict) -> dict:
 
     step_results = []
     for step in sorted(steps, key=lambda item: item.get("step", 0)):
-        result = _run_remediation_step(incident, diagnosis, step)
+        result = _run_remediation_step(incident, diagnosis, step, incident_id)
         step_results.append({"step": step.get("step"), **result})
-        if not result.get("success") or result.get("status") == "escalated":
+        if not result.get("success") or result.get("status") in ("escalated", "safety_vetoed"):
             result["steps"] = step_results
             return result
 
     final_result = step_results[-1].copy()
     final_result["steps"] = step_results
-    final_result["action_taken"] = "multiple_steps" if len(step_results) > 1 else final_result["action_taken"]
+    final_result["action_taken"] = (
+        "multiple_steps" if len(step_results) > 1 else final_result["action_taken"]
+    )
     final_result["reason"] = "All LLM remediation steps completed successfully."
     return final_result

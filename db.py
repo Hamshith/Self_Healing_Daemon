@@ -61,6 +61,30 @@ CREATE TABLE IF NOT EXISTS daemon_heartbeat (
     pods_monitored   INTEGER NOT NULL DEFAULT 0,
     anomalies_found INTEGER NOT NULL DEFAULT 0
 );
+
+-- Safety-layer interception log.
+-- One row per gate that fired, whether in production or in eval/safety_probe.py.
+-- event_type values match safety_layer.SafetyEventType:
+--   unlisted_action | invalid_parameter | extra_parameter |
+--   unsafe_auto_remediate | snapshot_written | snapshot_failed |
+--   verification_passed | verification_failed | rollback_triggered |
+--   rollback_succeeded | rollback_failed
+CREATE TABLE IF NOT EXISTS safety_events (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id          INTEGER,            -- NULL for probe-mode runs
+    event_type           TEXT NOT NULL,
+    layer                INTEGER NOT NULL,   -- 1..5
+    pod_name             TEXT,
+    namespace            TEXT,
+    proposed_action      TEXT,
+    veto_reason          TEXT,
+    proposed_parameters  TEXT,               -- JSON blob
+    recorded_at          TEXT NOT NULL,
+    FOREIGN KEY (incident_id) REFERENCES incidents(id)
+);
+CREATE INDEX IF NOT EXISTS idx_safety_events_incident  ON safety_events(incident_id);
+CREATE INDEX IF NOT EXISTS idx_safety_events_type      ON safety_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_safety_events_layer     ON safety_events(layer);
 """
 
 
@@ -380,6 +404,116 @@ def get_metrics() -> dict:
             "by_remediation_status": by_remediation_status,
             **get_mttd_mttr_stats(),
             "incidents_over_time": get_incidents_over_time(),
+        }
+    finally:
+        conn.close()
+
+
+def record_safety_event(event: dict) -> int:
+    """
+    Persist one safety-layer interception event.
+
+    *event* is a dict produced by SafetyEvent.to_dict() in safety_layer.py.
+    Returns the new row id.
+    """
+    conn = _get_conn()
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO safety_events
+                (incident_id, event_type, layer, pod_name, namespace,
+                 proposed_action, veto_reason, proposed_parameters, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.get("incident_id"),
+                event.get("event_type"),
+                event.get("layer", 0),
+                event.get("pod_name"),
+                event.get("namespace"),
+                event.get("proposed_action"),
+                event.get("veto_reason"),
+                event.get("proposed_parameters"),
+                event.get("recorded_at", datetime.utcnow().isoformat() + "Z"),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid or 0
+    finally:
+        conn.close()
+
+
+def get_safety_metrics() -> dict:
+    """
+    Compute safety-layer interception statistics for the paper's H5 section.
+
+    Returns counts and rates broken down by layer and event_type so the
+    paper can report:
+      - How many times each safety layer fired
+      - What fraction of LLM proposals were intercepted (interception_rate)
+      - Whether any unsafe action bypassed all gates (false_negative_rate)
+
+    A "remediation attempt" is any incident where safe_to_auto_remediate=True
+    (i.e. the LLM claimed it was safe to act).  Layer-2/3 events are
+    intercepts within those attempts.
+    """
+    conn = _get_conn()
+    try:
+        # Total safety events by layer
+        by_layer = {
+            row["layer"]: row["c"]
+            for row in conn.execute(
+                "SELECT layer, COUNT(*) AS c FROM safety_events GROUP BY layer"
+            ).fetchall()
+        }
+
+        # Total safety events by type
+        by_type = {
+            row["event_type"]: row["c"]
+            for row in conn.execute(
+                "SELECT event_type, COUNT(*) AS c "
+                "FROM safety_events GROUP BY event_type"
+            ).fetchall()
+        }
+
+        # Remediation attempts = incidents where safe_to_auto_remediate was True
+        total_attempts = conn.execute(
+            "SELECT COUNT(*) AS c FROM incidents WHERE safe_to_auto_remediate = 1"
+        ).fetchone()["c"]
+
+        # Intercepts = Layer-2 or Layer-3 safety events
+        layer2_intercepts = by_type.get("unlisted_action", 0)
+        layer3_intercepts = (
+            by_type.get("invalid_parameter", 0)
+            + by_type.get("extra_parameter", 0)
+        )
+        total_intercepts = layer2_intercepts + layer3_intercepts
+
+        interception_rate = (
+            total_intercepts / total_attempts if total_attempts else None
+        )
+
+        # Rollback events (Layer 5)
+        rollback_triggered  = by_type.get("rollback_triggered",  0)
+        rollback_succeeded  = by_type.get("rollback_succeeded",  0)
+        rollback_failed     = by_type.get("rollback_failed",     0)
+        verif_passed        = by_type.get("verification_passed", 0)
+        verif_failed        = by_type.get("verification_failed", 0)
+
+        return {
+            "total_remediation_attempts":  total_attempts,
+            "total_safety_intercepts":     total_intercepts,
+            "interception_rate":           interception_rate,
+            "layer2_unlisted_action":      layer2_intercepts,
+            "layer3_invalid_parameter":    by_type.get("invalid_parameter", 0),
+            "layer3_extra_parameter":      by_type.get("extra_parameter",   0),
+            "layer5_verification_passed":  verif_passed,
+            "layer5_verification_failed":  verif_failed,
+            "layer5_rollback_triggered":   rollback_triggered,
+            "layer5_rollback_succeeded":   rollback_succeeded,
+            "layer5_rollback_failed":      rollback_failed,
+            "by_layer":                    by_layer,
+            "by_type":                     by_type,
         }
     finally:
         conn.close()
