@@ -1,0 +1,53 @@
+# Novel fault fixture: ConfigEnvError
+#
+# The env var DATABASE_URL IS present (so no CreateContainerConfigError) but
+# points to a non-existent hostname.  The container starts, immediately fails
+# to connect to the DB, and exits with code 1 → CrashLoopBackOff.
+#
+# Status signal:  CrashLoopBackOff (same as ApplicationCrash)
+# Key evidence:   DATABASE_URL value in logs + DNS resolution error
+#
+# Rule-based baseline:  classifies as ApplicationCrash (CrashLoopBackOff)
+# ML baseline:          classifies as ApplicationCrash (same feature vector)
+# LLM-no-RAG:           may infer env var misconfiguration from DATABASE_URL log line
+# LLM+RAG:              should retrieve config-error-environment.md and classify as ConfigEnvError
+#
+# Apply:  kubectl apply -f k8s/eval/config-env-error-deployment.yaml
+# Remove: kubectl delete -f k8s/eval/config-env-error-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eval-config-env-error
+  namespace: default
+  labels:
+    app: eval-config-env-error
+    eval-scenario: config-env-error
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eval-config-env-error
+  template:
+    metadata:
+      labels:
+        app: eval-config-env-error
+        eval-scenario: config-env-error
+    spec:
+      containers:
+        - name: app
+          image: busybox:latest
+          env:
+            - name: DATABASE_URL
+              value: "postgres://db-wrong-host:5432/myapp"
+          command:
+            - sh
+            - -c
+            - |
+              echo "INFO  Loading configuration"
+              echo "INFO  DATABASE_URL=${DATABASE_URL}"
+              echo "ERROR psycopg2.OperationalError: could not translate host name \"db-wrong-host\" to address: Name or service not known"
+              echo "ERROR Failed to connect to database at ${DATABASE_URL}"
+              echo "FATAL Application startup failed: database connection refused"
+              echo "INFO  Exiting with code 1"
+              exit 1

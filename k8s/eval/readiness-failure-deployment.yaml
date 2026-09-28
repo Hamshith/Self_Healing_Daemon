@@ -1,0 +1,56 @@
+# Novel fault fixture: ReadinessFailure
+#
+# Pod phase is Running but the readiness probe consistently returns HTTP 503.
+# The pod is never added to the Service endpoint slice, so traffic silently
+# drops.  restart_count = 0, phase = Running — the detector's rulebook has
+# NO rule for this condition.
+#
+# Rule-based baseline:  no rule fires → returns Unknown / escalate
+# ML baseline:          no training samples for Running+0-restarts+failing → Unknown
+# LLM-no-RAG:           may infer readiness failure from events
+# LLM+RAG:              should retrieve readiness-probe-failure.md and classify correctly
+#
+# Apply:  kubectl apply -f k8s/eval/readiness-failure-deployment.yaml
+# Remove: kubectl delete -f k8s/eval/readiness-failure-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eval-readiness-failure
+  namespace: default
+  labels:
+    app: eval-readiness-failure
+    eval-scenario: readiness-failure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eval-readiness-failure
+  template:
+    metadata:
+      labels:
+        app: eval-readiness-failure
+        eval-scenario: readiness-failure
+    spec:
+      containers:
+        - name: app
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "INFO  Server started on :8080"
+              echo "WARN  Primary DB connection pool exhausted: 0 connections available"
+              echo "WARN  Readiness check failing: DB pool exhausted"
+              # Keep the container alive (Running) but not Ready
+              while true; do
+                echo "INFO  GET /health → 503 (database not ready)"
+                sleep 15
+              done
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9999    # wrong port — probe always fails
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3

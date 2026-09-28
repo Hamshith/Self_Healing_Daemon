@@ -1,0 +1,47 @@
+# Novel fault fixture: DependencyFailure
+#
+# The app itself is healthy — it tries to connect to a Redis service that
+# does NOT exist in the cluster.  The container exits with code 1 on every
+# start (CrashLoopBackOff visible in status) but the ROOT CAUSE is a broken
+# downstream dependency, not an application bug.
+#
+# Rule-based baseline:  classifies as ApplicationCrash (CrashLoopBackOff signal)
+# ML baseline:          classifies as ApplicationCrash (same features)
+# LLM-no-RAG:           may infer DependencyFailure from the log text
+# LLM+RAG:              should retrieve dependency-failure.md and correctly classify
+#
+# Apply:  kubectl apply -f k8s/eval/dependency-failure-deployment.yaml
+# Remove: kubectl delete -f k8s/eval/dependency-failure-deployment.yaml
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: eval-dependency-failure
+  namespace: default
+  labels:
+    app: eval-dependency-failure
+    eval-scenario: dependency-failure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: eval-dependency-failure
+  template:
+    metadata:
+      labels:
+        app: eval-dependency-failure
+        eval-scenario: dependency-failure
+    spec:
+      containers:
+        - name: app
+          image: busybox:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "INFO  Starting application"
+              echo "INFO  Connecting to redis://redis-service:6379"
+              echo "ERROR redis.exceptions.ConnectionError: Error 111 connecting to redis-service:6379. Connection refused."
+              echo "ERROR Failed to initialize cache layer — aborting startup"
+              echo "FATAL Unhandled exception during boot: ConnectionRefused"
+              exit 1

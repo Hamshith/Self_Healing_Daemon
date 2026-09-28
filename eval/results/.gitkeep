@@ -1,0 +1,2 @@
+# placeholder — eval/results/ holds JSONL output from eval/harness.py
+# This directory is gitignored (results files can be large).

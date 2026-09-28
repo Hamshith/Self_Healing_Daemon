@@ -2,12 +2,9 @@
 
 A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Kubernetes failure modes, measures real in-cluster network latency, and leverages **Google Gemini** to diagnose incidents automatically.
 
-Gemini returns an ordered `remediation_steps` list with an allow-listed action
-for each step. The remediator executes only supported Kubernetes operations
-(`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is
-true; human-only work is returned as `escalate`. The matching runbook in
-`runbooks/` defines the investigation and remediation sequence supplied to
-Gemini.
+Gemini returns an ordered `remediation_steps` list with an allow-listed action for each step. The remediator executes only supported Kubernetes operations (`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is true; human-only work is returned as `escalate`. After every successful remediation the daemon **polls the pod for up to 2 minutes** and only records the incident as remediated once the pod is stable. If it never stabilises the pre-action snapshot is used to roll back the change automatically.
+
+A companion **comparative evaluation framework** (`eval/`) lets you run all four methods — rule-based, Random Forest, LLM-without-RAG, and LLM+RAG — on identical fault instances and compare them across four measurable hypotheses (H1 diagnosis accuracy, H2 remediation quality, H3 novel-fault handling, H4 latency/cost).
 
 ---
 
@@ -39,6 +36,9 @@ source venv/bin/activate
 
 # Install Python dependencies
 pip install -r requirements.txt
+
+# For the ML baseline in the evaluation framework:
+pip install scikit-learn
 
 # Create your .env file from the template
 copy .env.example .env      # Windows
@@ -88,26 +88,18 @@ kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 909
 ## 5. Install Chaos Mesh via Helm
 
 ```bash
-# Add the ChaosMesh community Helm chart repo
 helm repo add chaos-mesh https://charts.chaos-mesh.org
 helm repo update
-
-# Install kube-chaos-mesh-stack
 helm install chaos-mesh chaos-mesh/chaos-mesh -n=chaos-mesh --create-namespace --version 2.8.4
-
 ```
 
-Chaos Mesh is required only for the NetworkLatency scenario. Verify that its
-controller and daemon pods are ready before applying a NetworkChaos resource:
+Chaos Mesh is required only for the NetworkLatency scenario. Verify its pods are ready before applying a NetworkChaos resource:
 
 ```bash
 kubectl get pods -n chaos-mesh
 ```
 
-The daemon creates a short-lived curl pod inside the cluster and measures the
-configured service URL. It reports `NetworkLatency` only when Chaos Mesh
-reports `AllInjected=True` and measured latency is at least
-`NETWORK_LATENCY_THRESHOLD_MS` (250 ms by default).
+The daemon creates a short-lived curl pod and measures the configured service URL. It reports `NetworkLatency` only when Chaos Mesh reports `AllInjected=True` **and** measured latency is at least `NETWORK_LATENCY_THRESHOLD_MS` (250 ms by default).
 
 These settings can be overridden in `.env`:
 
@@ -118,18 +110,12 @@ NETWORK_LATENCY_PROBE_IMAGE=curlimages/curl:8.10.1
 NETWORK_LATENCY_PROBE_TIMEOUT_SECONDS=60
 ```
 
-The Kubernetes identity running the daemon needs permission to create, read,
-exec into, and delete pods in the probe namespace.
-
 ---
 
 ## 6. Deploy the Healthy Baseline
 
 ```bash
-# Deploy healthy baseline pods (nginx frontend + httpd backend)
 kubectl apply -f k8s/sample-app.yaml
-
-# Verify pods are running
 kubectl get pods
 ```
 
@@ -143,13 +129,24 @@ python daemon.py
 
 You should see a startup banner followed by periodic cluster checks every 30 seconds.
 
+### Daemon operational guarantees
+
+| Behaviour | Detail |
+|---|---|
+| **Incident deduplication** | A `(pod, fault_type)` pair is suppressed for 5 minutes after first action. No duplicate Gemini calls or DB rows per fault. |
+| **Post-remediation verification** | After `patch_memory` or `delete_pod`, the daemon polls the pod every 15 s for up to 120 s. The incident is only marked `remediated` after 2 consecutive healthy checks. |
+| **Automatic rollback** | If verification times out, the pre-action rollback snapshot (in `rollbacks/`) is applied and the incident is recorded as `rolled_back`. |
+| **RAG retrieval path logging** | Every `retrieve()` call logs `[retrieval=SEMANTIC]` or `[retrieval=LEXICAL] WARNING` so a degraded run is always visible in the output. |
+
+---
+
 ## 8. Run the Dashboard
 
-The dashboard reads the same `incidents.db` file written by the daemon. Start the
-API and frontend in separate terminals from `Self_Healing_Daemon`:
-
 ```bash
+# Terminal 1 — FastAPI backend
 uvicorn api:app --reload --port 8000
+
+# Terminal 2 — Vite frontend
 cd frontend
 npm install
 npm run dev
@@ -161,23 +158,16 @@ Open the Vite URL shown in the terminal (normally `http://localhost:5173`).
 
 ## 9. Inject Fault Scenarios
 
-Apply one scenario at a time from a separate terminal. Wait for the affected
-pod to be created before checking its status. Do not apply every fault
-manifest together because each scenario is intended to be isolated.
+Apply one scenario at a time. Wait for the affected pod to be created before checking its status.
 
 ### CrashLoopBackOff / ApplicationCrash
-
-The container exits with code 1 and eventually enters CrashLoopBackOff.
 
 ```bash
 kubectl apply -f k8s/broken-deployment.yaml
 kubectl get pods -l app=broken-service -w
 ```
 
-### ConfigError
-
-The deployment references the missing `mongo-config` ConfigMap, so the pod
-should report CreateContainerConfigError.
+### ConfigError (missing ConfigMap)
 
 ```bash
 kubectl apply -f k8s/configerror-deployment.yaml
@@ -185,10 +175,7 @@ kubectl get pods -l app=mongodb -w
 kubectl describe pod -l app=mongodb
 ```
 
-### Missing Secret / ConfigError
-
-The deployment references the missing `db-credentials` Secret, so the pod
-should fail during container configuration.
+### ConfigError (missing Secret)
 
 ```bash
 kubectl apply -f k8s/missingsecret-deployment.yaml
@@ -198,8 +185,6 @@ kubectl describe pod -l app=mongodb-secret
 
 ### ImagePullError
 
-The manifest uses a deliberately nonexistent nginx image tag.
-
 ```bash
 kubectl apply -f k8s/imagepullerror-deployment.yaml
 kubectl get pods -l app=image-pull-error -w
@@ -208,8 +193,7 @@ kubectl describe pod -l app=image-pull-error
 
 ### OOMKilled
 
-The application exceeds its 100 MiB memory limit. The daemon should detect
-OOMKilled and increase the owning Deployment's memory limit by 25 percent.
+The daemon detects OOMKilled and patches the owning Deployment's memory limit. It then verifies the pod becomes stable before marking the incident remediated.
 
 ```bash
 kubectl apply -f k8s/oom-deployment.yaml
@@ -226,28 +210,15 @@ kubectl get deployment oom-service \
 
 ### CPUThrottle
 
-The container has a 50 millicore CPU limit. The daemon compares metrics-server
-usage against that limit after three consecutive high-usage polls.
-
 ```bash
 kubectl apply -f k8s/cputhrottle-deployment.yaml
 kubectl get pods -l app=cputhrottle-service -w
 kubectl top pod -l app=cputhrottle-service
 ```
 
-The deployment comments also reference these Prometheus counters for manual
-investigation:
-
-```text
-container_cpu_cfs_throttled_periods_total
-container_cpu_cfs_periods_total
-```
-
 ### NetworkLatency
 
-Apply the nginx service first, wait until its pod is ready, and then apply the
-separate NetworkChaos manifest. Applying the chaos resource before the target
-pod exists can result in `Failed to select targets: no pod is selected`.
+Apply the nginx service first, wait until it is ready, then apply the chaos resource:
 
 ```bash
 kubectl apply -f k8s/networklatency-deployment.yaml
@@ -255,25 +226,15 @@ kubectl wait --for=condition=ready pod -l app=nginx --timeout=120s
 kubectl apply -f k8s/networklatency-creater.yaml
 ```
 
-Verify that Chaos Mesh selected and injected the delay:
+Verify the injection:
 
 ```bash
 kubectl describe networkchaos chaos-creater -n default
 kubectl get networkchaos chaos-creater -n default \
   -o jsonpath="{range .status.conditions[*]}{.type}={.status}{'\n'}{end}"
-kubectl get networkchaos chaos-creater -n default \
-  -o jsonpath="{.status.experiment.containerRecords[0].phase}{'\n'}"
 ```
 
-The expected state is `Selected=True`, `AllInjected=True`, and phase
-`Injected`. To manually measure the service from inside the cluster:
-
-```bash
-kubectl run tmp-curl --rm -it --image=curlimages/curl:8.10.1 \
-  --restart=Never -- curl -o /dev/null -sS \
-  -w "latency=%{time_total}s\n" \
-  http://nginx-service.default.svc.cluster.local
-```
+Expected state: `Selected=True`, `AllInjected=True`, phase `Injected`.
 
 ---
 
@@ -281,14 +242,14 @@ kubectl run tmp-curl --rm -it --image=curlimages/curl:8.10.1 \
 
 Once the daemon detects a fault:
 
-1. It collects pod logs, restart counts, and Kubernetes warning events.
-2. It sends all signals to **Gemini** for analysis.
-3. A colour-coded **Incident Diagnosis Report** is printed to the terminal showing:
-  - LLM-derived error, root cause, and category
-  - Confidence and evidence-derived severity
-   - Evidence (specific log lines / events)
-   - Recommended remediation command
-4. The report is saved as a timestamped JSON file in the `incidents/` directory.
+1. It checks the `(pod, fault_type)` deduplication table — if the same fault was actioned within the last 5 minutes, it is skipped.
+2. It collects pod logs, restart counts, and Kubernetes warning events.
+3. It sends all signals to **Gemini** for analysis (with RAG-retrieved runbook context).
+4. A colour-coded **Incident Diagnosis Report** is printed to the terminal.
+5. The report is saved as a timestamped JSON file in `incidents/` and written to `incidents.db`.
+6. The remediator executes the allow-listed action (if `safe_to_auto_remediate` is true).
+7. The daemon polls the pod for up to 2 minutes to verify the fix held.
+8. Status is finalised as `remediated`, `verification_failed`, or `rolled_back`.
 
 Example terminal output:
 
@@ -296,19 +257,90 @@ Example terminal output:
 ╔════════════════════════════════════════════════════════════╗
 ║  🔍  INCIDENT DIAGNOSIS REPORT                            ║
 ╠════════════════════════════════════════════════════════════╣
-║  Timestamp        2026-05-03T14:22:01Z                     ║
-║  Pod Name         broken-service-7b9d5c6f8-xk2lp           ║
-║  Restart Count    5                                         ║
-║  Severity         CRITICAL                                  ║
+║  Timestamp        2026-09-28T18:22:01Z                     ║
+║  Pod Name         oom-service-7b9d5c6f8-xk2lp              ║
+║  Restart Count    3                                         ║
+║  Severity         HIGH                                      ║
 ╚════════════════════════════════════════════════════════════╝
+[daemon] Verifying remediation for oom-service (up to 120s, need 2 consecutive healthy polls)
+[daemon] oom-service healthy (1/2)
+[daemon] oom-service healthy (2/2)
+[daemon] Remediation verified for oom-service
 ```
 
 ---
 
-## 11. Clean Up
+## 11. Comparative Evaluation Framework
+
+The `eval/` package implements a rigorous experiment comparing four methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
+
+### Four methods
+
+| Method | Description | API calls | Latency |
+|---|---|---|---|
+| `rule_based` | Explicit decision table over structured signals | 0 | < 1 ms |
+| `ml` | Random Forest over 7 numeric features | 0 | ~10 ms |
+| `llm_no_rag` | Gemini with **no runbook context** (ablation) | 1–2 | 1–5 s |
+| `llm_rag` | Gemini + RAG-retrieved runbook chunks | 1–2 | 1–5 s |
+
+### Hypotheses tested
+
+| # | Claim | Expected finding |
+|---|---|---|
+| **H1** | Diagnosis accuracy (% correct category) | Baselines ≈ 100% on known faults; LLM wins on ambiguous signals |
+| **H2** | Remediation quality (unsafe-action rate) | All equal — same allow-list enforced for every method |
+| **H3** | Novel fault accuracy | Baselines ≈ 0%; LLM+RAG > LLM-no-RAG > 0% |
+| **H4** | Latency and API cost per incident | Baselines win on cost; LLM wins on quality |
+
+### Fault scenarios
+
+**7 known faults** (covered by the detector's built-in rules):
+`ApplicationCrash`, `OOMKilled`, `ImagePullError`, `ConfigError` ×2, `CPUThrottle`, `NetworkLatency`
+
+**3 novel faults** (not in the detector's rulebook — the key H3 test):
+
+| Scenario | Why baselines fail |
+|---|---|
+| `DependencyFailure` | Status = CrashLoopBackOff → baselines say ApplicationCrash; only logs reveal Redis `ConnectionRefused` |
+| `ReadinessFailure` | Phase = Running, restarts = 0 → no rule fires; only events say "Readiness probe failed" |
+| `ConfigEnvError` | Status = CrashLoopBackOff → baselines say ApplicationCrash; logs show bad `DATABASE_URL` value |
+
+### Controls
+
+| Control | Implementation |
+|---|---|
+| Identical incident dict per trial | All methods share the same `_build_incident_from_scenario()` output |
+| Same allow-list | `SAFE_ACTIONS` from `eval/types.py` — used by every method |
+| RAG query excludes `fault_type` label | Query built from log snippet + event reasons only |
+| Fixed model version + temperature | `config.MODEL`, `EVAL_TEMPERATURE=0.0` |
+| Variance reported | 95% Wilson CI on all accuracy figures |
+| Minimum 20 trials per scenario | Configurable via `--trials` |
+
+### Running the evaluation
 
 ```bash
-# Remove any scenario that is still deployed
+# Smoke-test (no cluster, no API calls needed):
+python -m eval.harness --trials 2 --methods rule_based ml --dry-run
+
+# Known faults only, all methods, 20 trials (requires cluster + API key):
+python -m eval.harness --trials 20 --scenarios known
+
+# Novel faults only, LLM methods only:
+python -m eval.harness --trials 20 --scenarios novel --methods llm_no_rag llm_rag
+
+# Full evaluation:
+python -m eval.harness --trials 20 --output eval/results/full_run.jsonl
+
+# Analyse and produce a paper-ready Markdown table:
+python -m eval.analyze_results eval/results/full_run.jsonl --format md --output eval/results/report.md
+```
+
+---
+
+## 12. Clean Up
+
+```bash
+# Remove fault scenarios
 kubectl delete -f k8s/broken-deployment.yaml
 kubectl delete -f k8s/configerror-deployment.yaml
 kubectl delete -f k8s/missingsecret-deployment.yaml
@@ -318,13 +350,18 @@ kubectl delete -f k8s/cputhrottle-deployment.yaml
 kubectl delete -f k8s/networklatency-creater.yaml
 kubectl delete -f k8s/networklatency-deployment.yaml
 
+# Remove novel-fault eval fixtures (if applied)
+kubectl delete -f k8s/eval/dependency-failure-deployment.yaml
+kubectl delete -f k8s/eval/readiness-failure-deployment.yaml
+kubectl delete -f k8s/eval/config-env-error-deployment.yaml
+
 # Remove the healthy baseline
 kubectl delete -f k8s/sample-app.yaml
 
-# Uninstall Prometheus (if installed)
+# Uninstall Prometheus
 helm uninstall prometheus -n monitoring
 
-# Uninstall Chaos Mesh (if installed)
+# Uninstall Chaos Mesh
 helm uninstall chaos-mesh -n chaos-mesh
 
 # Stop minikube
@@ -336,27 +373,78 @@ minikube delete
 
 ---
 
-## 12. Project Structure
+## 13. Project Structure
 
 ```
 self-healing-daemon/
-├── daemon.py              # Main daemon loop
-├── collector.py           # Signal collection (Prometheus + K8s API)
-├── detector.py            # Anomaly detection logic
-├── llm_client.py          # Google Gemini API integration + prompt
-├── reporter.py            # Formats and saves incident reports
-├── config.py              # All config constants in one place
-├── requirements.txt       # All pip dependencies
-├── .env.example           # Template for environment variables
-├── k8s/
-│   ├── broken-deployment.yaml          # ApplicationCrash
-│   ├── configerror-deployment.yaml     # Missing ConfigMap
-│   ├── cputhrottle-deployment.yaml     # CPUThrottle
-│   ├── imagepullerror-deployment.yaml  # ImagePullError
-│   ├── missingsecret-deployment.yaml   # Missing Secret
-│   ├── networklatency-creater.yaml     # Chaos Mesh NetworkChaos
-│   ├── networklatency-deployment.yaml  # nginx target service
+├── daemon.py                    # Main daemon loop (dedup, verification, rollback watcher)
+├── collector.py                 # Signal collection (Prometheus + K8s API)
+├── detector.py                  # Anomaly detection (7 fault types)
+├── llm_client.py                # Google Gemini integration + prompt builder
+├── remediator.py                # Allow-listed Kubernetes actions + rollback_action()
+├── reporter.py                  # Formats and saves incident reports
+├── rag_engine.py                # ChromaDB + sentence-transformers runbook retrieval
+├── correlation.py               # Service-neighbourhood temporal correlation
+├── db.py                        # SQLite incident store + MTTD/MTTR queries
+├── incident_report_generator.py # Post-mortem Markdown reports
+├── api.py                       # FastAPI backend for the dashboard
+├── config.py                    # All config constants
+├── requirements.txt             # Python dependencies
+├── .env.example                 # Environment variable template
+│
+├── eval/                        # Comparative evaluation framework
+│   ├── types.py                 # EvalResult, ScenarioSpec, SAFE_ACTIONS
+│   ├── scenarios.py             # 7 known + 3 novel fault scenario registry
+│   ├── rule_based.py            # Rule-table baseline (< 1 ms, 0 API calls)
+│   ├── ml_baseline.py           # Random Forest baseline (scikit-learn)
+│   ├── llm_methods.py           # LLM-no-RAG and LLM+RAG wrappers
+│   ├── harness.py               # Orchestrator — runs all methods, writes JSONL
+│   ├── analyze_results.py       # H1–H4 statistics, CI, confusion matrices
+│   └── results/                 # JSONL output files (one per run)
+│
+├── k8s/                         # Kubernetes fault fixtures
+│   ├── broken-deployment.yaml           # ApplicationCrash
+│   ├── configerror-deployment.yaml      # Missing ConfigMap
+│   ├── cputhrottle-deployment.yaml      # CPUThrottle
+│   ├── imagepullerror-deployment.yaml   # ImagePullError
+│   ├── missingsecret-deployment.yaml    # Missing Secret
+│   ├── networklatency-creater.yaml      # Chaos Mesh NetworkChaos
+│   ├── networklatency-deployment.yaml   # nginx target service
 │   ├── oom-deployment.yaml              # OOMKilled
-│   └── sample-app.yaml                  # Healthy baseline apps
-└── README.md              # This file
+│   ├── sample-app.yaml                  # Healthy baseline
+│   └── eval/                            # Novel-fault fixtures (evaluation only)
+│       ├── dependency-failure-deployment.yaml
+│       ├── readiness-failure-deployment.yaml
+│       └── config-env-error-deployment.yaml
+│
+├── runbooks/                    # 15 runbooks (investigation + remediation steps)
+├── rollbacks/                   # Pre-action snapshots written before each remediation
+├── incidents/                   # Timestamped JSON incident reports
+├── reports/                     # Post-mortem Markdown reports
+└── frontend/                    # Vite dashboard
 ```
+
+---
+
+## 14. Key Design Decisions
+
+### Safety model
+Every action the LLM recommends is validated against a fixed allow-list (`delete_pod`, `increase_memory_limit`, `escalate`). Free-form shell commands from the LLM are never executed. The `safe_to_auto_remediate` flag must be `true` before any action runs.
+
+### Remediation lifecycle
+```
+detected → in_progress → verifying → remediated
+                                   ↘ verification_failed → rolled_back
+```
+
+### RAG retrieval transparency
+Every call to `rag_engine.retrieve()` logs `[retrieval=SEMANTIC]` or `[retrieval=LEXICAL] WARNING`. A run that degraded to keyword-overlap is always distinguishable from one that used semantic search — they are not interchangeable for accuracy evaluation.
+
+### Correlation scope
+`correlation.py` groups pods by shared Kubernetes Service membership and timing within a 120-second window. It does **not** establish causal direction (e.g., "B called A, so A is the root cause") — that requires distributed tracing. The `correlation_context` note in every incident makes this limitation explicit.
+
+### Evaluation integrity
+The `eval/` framework enforces three controls that prevent inflated results:
+1. The RAG query is built from log content and event reasons — the `fault_type` label is withheld so retrieval cannot trivially match the fault name in the runbook heading.
+2. The ML model is trained only on known fault classes — novel faults are deliberately excluded from training to produce an honest H3 measurement.
+3. The same `SAFE_ACTIONS` allow-list is enforced for every method — H2 measures decision quality, not guardrail differences.
