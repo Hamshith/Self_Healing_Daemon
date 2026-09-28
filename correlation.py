@@ -1,4 +1,25 @@
-"""Best-effort correlation of nearby pod failures through Kubernetes Services."""
+"""
+Best-effort temporal correlation of nearby pod failures via Kubernetes Services.
+
+What this module does
+─────────────────────
+Within a configurable sliding window (CORRELATION_WINDOW_SECONDS) it
+groups recently-detected anomalies by shared Kubernetes Service membership
+or shared namespace, and attaches that neighbourhood context to each new
+anomaly before it is sent to the LLM.  The LLM can use this signal to
+note that "pod A and pod B failed within 2 minutes of each other and both
+sit behind the same Service", which may influence its root-cause reasoning.
+
+What this module does NOT do
+────────────────────────────
+It does NOT establish causal direction between failures (e.g. "B called A,
+so A is the root cause").  Kubernetes Services tell us which pods share a
+load-balancer, not which pod is a client of which.  True dependency
+directionality would require distributed tracing (e.g. OpenTelemetry spans
+with parent→child relationships).  The correlation_context note field makes
+this limitation explicit so the LLM prompt and any downstream paper/report
+do not overstate what was inferred.
+"""
 
 from __future__ import annotations
 

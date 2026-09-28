@@ -53,13 +53,28 @@ def _embedding_batches(documents: list[dict[str, str]], batch_size: int):
         yield documents[start:start + batch_size]
 
 
+# ── Retrieval-path tracking ────────────────────────────────────────────────
+# Set at index-build time so every subsequent retrieve() call logs which
+# path it actually takes.  Any analysis run that used the lexical fallback
+# must be clearly distinguished from one that used semantic search.
+_RETRIEVAL_MODE_SEMANTIC = "semantic"
+_RETRIEVAL_MODE_LEXICAL = "lexical (chromadb/sentence-transformers unavailable)"
+_retrieval_mode: str = _RETRIEVAL_MODE_LEXICAL  # overwritten in build_index if ML stack is OK
+
+
 def build_index() -> int:
-    """Build or refresh the runbook index and return the chunk count."""
+    """
+    Build or refresh the runbook index and return the chunk count.
+
+    Logs the retrieval mode that will be used for all subsequent retrieve()
+    calls so that any analysis run is clearly tagged as semantic or lexical.
+    """
     started_at = time.perf_counter()
     print(f"[rag_engine] Starting runbook index build: {RUNBOOKS_DIR}", flush=True)
-    global _collection, _documents, _model
+    global _collection, _documents, _model, _retrieval_mode
     _documents = _load_documents()
     _collection = None
+    _retrieval_mode = _RETRIEVAL_MODE_LEXICAL  # default; overwritten below on success
     print(f"[rag_engine] Loaded {len(_documents)} runbook chunks", flush=True)
     try:
         print("[rag_engine] Importing chromadb...", flush=True)
@@ -104,14 +119,21 @@ def build_index() -> int:
                     metadatas=[{"source": item["source"]} for item in batch],
                     embeddings=embeddings,
                 )
+        _retrieval_mode = _RETRIEVAL_MODE_SEMANTIC
         print(
-            f"[rag_engine] Vector DB ready: {_collection.count()} records "
+            f"[rag_engine] Vector DB ready ({_retrieval_mode}): "
+            f"{_collection.count()} records "
             f"in {time.perf_counter() - started_at:.2f}s"
         )
     except (ImportError, OSError, RuntimeError) as exc:
-        # Retrieval still works lexically when optional ML dependencies are absent.
+        # chromadb or sentence-transformers not available — fall back to
+        # keyword overlap.  Log prominently so results are not silently
+        # attributed to semantic search.
+        _retrieval_mode = _RETRIEVAL_MODE_LEXICAL
         print(
-            f"[rag_engine] Semantic index unavailable; using lexical retrieval: {exc} "
+            f"[rag_engine] WARNING: Semantic index unavailable — "
+            f"ALL retrieve() calls this run will use LEXICAL (keyword-overlap) "
+            f"retrieval.  Reason: {exc} "
             f"({time.perf_counter() - started_at:.2f}s)"
         )
     return len(_documents)
@@ -129,12 +151,23 @@ def _lexical_retrieve(query: str, top_k: int) -> list[dict[str, str]]:
 
 
 def retrieve(query: str, top_k: int = 3) -> list[dict[str, str]]:
-    """Return the most relevant runbook chunks for *query*."""
+    """
+    Return the most relevant runbook chunks for *query*.
+
+    The retrieval path (semantic or lexical) is logged on every call so that
+    any analysis run using the lexical fallback is unambiguously identifiable
+    in logs — the two paths are NOT interchangeable for accuracy evaluation.
+    """
     if not _documents:
         print("[rag_engine] No in-memory documents; building index lazily")
         build_index()
+
     if _collection is not None and _model is not None and _documents:
-        print(f"[rag_engine] Retrieving top {top_k} semantic runbook chunks")
+        # ── Semantic path ─────────────────────────────────────────────────
+        print(
+            f"[rag_engine][retrieval=SEMANTIC] Querying top {top_k} chunks "
+            f"via ChromaDB + all-MiniLM-L6-v2"
+        )
         embedding = _model.encode([query]).tolist()
         result = _collection.query(query_embeddings=embedding, n_results=top_k)
         documents = result.get("documents", [[]])[0]
@@ -143,12 +176,32 @@ def retrieve(query: str, top_k: int = 3) -> list[dict[str, str]]:
             {"text": text, "source": metadata.get("source", "unknown")}
             for text, metadata in zip(documents, metadatas)
         ]
-        print(f"[rag_engine] Semantic matches: {[item['source'] for item in matches]}")
+        print(
+            f"[rag_engine][retrieval=SEMANTIC] Matched: "
+            f"{[item['source'] for item in matches]}"
+        )
         return matches
-    print(f"[rag_engine] Retrieving top {top_k} lexical runbook matches")
+
+    # ── Lexical fallback path ─────────────────────────────────────────────
+    # Log clearly so any experiment or paper that consumed these results
+    # can be distinguished from one that ran with semantic search.
+    print(
+        f"[rag_engine][retrieval=LEXICAL] WARNING — using keyword-overlap fallback "
+        f"(chromadb/sentence-transformers unavailable). "
+        f"Results are NOT comparable to semantic search. "
+        f"Querying top {top_k} chunks."
+    )
     matches = _lexical_retrieve(query, top_k)
-    print(f"[rag_engine] Lexical matches: {[item['source'] for item in matches]}")
+    print(
+        f"[rag_engine][retrieval=LEXICAL] Matched: "
+        f"{[item['source'] for item in matches]}"
+    )
     return matches
+
+
+def get_retrieval_mode() -> str:
+    """Return the active retrieval mode string for logging/reporting."""
+    return _retrieval_mode
 
 
 def format_context(results: list[dict[str, str]]) -> str:

@@ -12,13 +12,13 @@ commands from the LLM are never passed to a shell.
 Hard rule: nothing executes unless diagnosis["safe_to_auto_remediate"] is
 True and the diagnosis contains valid remediation steps.
 
-Rollback (roadmap Phase 2 Step 4):
+Rollback (implemented in daemon.py, called via rollback_action() below):
     Before executing any action we snapshot enough state to undo it, and
-    write that snapshot to rollbacks/<pod_name>_<timestamp>.json. This
-    module does NOT implement the "wait 2 minutes, check if still
-    crashing, auto-rollback" watcher -- that requires tracking state
-    across poll cycles and belongs in daemon.py's main loop, calling
-    rollback_action() below with the snapshot path if the fix didn't hold.
+    write that snapshot to rollbacks/<pod_name>_<timestamp>.json.
+    daemon.py's _verify_remediation() polls the pod for up to
+    VERIFICATION_POLL_SECONDS after a remediation action; if the pod does
+    not become stable it calls rollback_action() with the snapshot path to
+    undo the change and records the incident as "rolled_back".
 """
 
 import json
@@ -414,8 +414,10 @@ def rollback_action(rollback_path: str) -> dict:
     """
     Undo a previously executed action using its saved snapshot.
 
-    Called by daemon.py's watcher (NOT implemented in this file) if a
-    pod is still crashing ~2 minutes after remediation.
+    Called by daemon.py's _verify_remediation() watcher when a pod fails
+    to become stable within VERIFICATION_POLL_SECONDS after remediation.
+    The rollback path is the JSON snapshot written by _write_rollback_snapshot()
+    before the original action was applied.
     """
     with open(rollback_path) as f:
         snapshot = json.load(f)
