@@ -95,7 +95,8 @@ def build_index() -> int:
         existing_count = _collection.count()
         print(f"[rag_engine] Existing ChromaDB records: {existing_count}", flush=True)
         if existing_count:
-            _collection.delete(where={})
+            ids = _collection.get()["ids"]
+            _collection.delete(ids=ids)
         if _documents:
             batch_size = config.EMBEDDING_BATCH_SIZE
             batch_count = (len(_documents) + batch_size - 1) // batch_size

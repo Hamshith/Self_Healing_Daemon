@@ -46,6 +46,8 @@ eval/results/safety_probe*_summary.json
 # ── ML model artefacts (if saved to disk in future) ────────────────────────
 eval/results/*.pkl
 eval/results/*.joblib
+/finetuning/qwen-k8s-diagnosis-3b/
+/dataset/
 
 # ── Miscellaneous ───────────────────────────────────────────────────────────
 IMPLEMENTATION_NOTES.md
