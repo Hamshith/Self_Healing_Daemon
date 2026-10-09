@@ -36,8 +36,12 @@ Limitations (stated honestly for the paper)
 """
 from __future__ import annotations
 
+import json
+import os
+import tempfile
 import time
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -73,6 +77,9 @@ _TERMINATED_REASONS = ["none", "OOMKilled", "Error", "other"]
 
 _WAITING_IDX = {r: i for i, r in enumerate(_WAITING_REASONS)}
 _TERMINATED_IDX = {r: i for i, r in enumerate(_TERMINATED_REASONS)}
+_TRAINING_DATA_PATH = Path(__file__).resolve().parent / "data" / "ml_baseline_training.json"
+_TRAINING_DATA_FORMAT_VERSION = 1
+_TRAINING_DATA_SEED = 42
 
 
 def extract_features(incident: dict) -> list[float]:
@@ -164,7 +171,7 @@ def generate_training_data() -> tuple[list[list[float]], list[str]]:
     are deliberately NOT included in training — demonstrating H3, the model
     cannot classify what it has never seen.
     """
-    rng = np.random.default_rng(42)
+    rng = np.random.default_rng(_TRAINING_DATA_SEED)
     X: list[list[float]] = []
     y: list[str] = []
 
@@ -198,6 +205,83 @@ def generate_training_data() -> tuple[list[list[float]], list[str]]:
     return X, y
 
 
+def load_or_generate_training_data() -> tuple[list[list[float]], list[str]]:
+    """Load the persistent synthetic dataset, creating it once if absent."""
+    if _TRAINING_DATA_PATH.exists():
+        try:
+            payload = json.loads(_TRAINING_DATA_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Could not read cached ML training data at "
+                f"{_TRAINING_DATA_PATH}: {exc}"
+            ) from exc
+
+        if (
+            not isinstance(payload, dict)
+            or payload.get("format_version") != _TRAINING_DATA_FORMAT_VERSION
+            or payload.get("seed") != _TRAINING_DATA_SEED
+        ):
+            raise ValueError(
+                f"Cached ML training data at {_TRAINING_DATA_PATH} has an "
+                "unsupported format or seed. Remove that file to regenerate it."
+            )
+
+        X = payload.get("features")
+        y = payload.get("labels")
+        if (
+            not isinstance(X, list)
+            or not isinstance(y, list)
+            or len(X) != len(y)
+            or not X
+            or any(
+                not isinstance(row, list)
+                or len(row) != 7
+                or any(
+                    not isinstance(value, (int, float)) or isinstance(value, bool)
+                    for value in row
+                )
+                for row in X
+            )
+            or any(not isinstance(label, str) for label in y)
+        ):
+            raise ValueError(
+                f"Cached ML training data at {_TRAINING_DATA_PATH} is invalid. "
+                "Remove that file to regenerate it."
+            )
+
+        print(f"[ml_baseline] Loaded {len(X)} samples from {_TRAINING_DATA_PATH}")
+        return X, y
+
+    X, y = generate_training_data()
+    payload = {
+        "format_version": _TRAINING_DATA_FORMAT_VERSION,
+        "seed": _TRAINING_DATA_SEED,
+        "features": [[float(value) for value in row] for row in X],
+        "labels": y,
+    }
+    _TRAINING_DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=_TRAINING_DATA_PATH.parent,
+            prefix=f"{_TRAINING_DATA_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_path = temp_file.name
+            json.dump(payload, temp_file, separators=(",", ":"))
+            temp_file.write("\n")
+        os.replace(temp_path, _TRAINING_DATA_PATH)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    print(f"[ml_baseline] Generated and saved {len(X)} samples to {_TRAINING_DATA_PATH}")
+    return X, y
+
+
 # ── Model wrapper ─────────────────────────────────────────────────────────
 
 class MLClassifier:
@@ -211,10 +295,10 @@ class MLClassifier:
         self._trained = False
 
     def fit(self):
-        """Train on synthetically generated data. Call once before any predict()."""
+        """Train on the persistent synthetic dataset. Call before predict()."""
         if not _SKLEARN_AVAILABLE:
             return self
-        X, y = generate_training_data()
+        X, y = load_or_generate_training_data()
         self._model = RandomForestClassifier(
             n_estimators=200,
             max_depth=None,

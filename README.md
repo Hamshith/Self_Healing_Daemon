@@ -4,7 +4,7 @@ A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Ku
 
 Gemini returns an ordered `remediation_steps` list with an allow-listed action for each step. The remediator executes only supported Kubernetes operations (`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is true; human-only work is returned as `escalate`. After every successful remediation the daemon **polls the pod for up to 2 minutes** and only records the incident as remediated once the pod is stable. If it never stabilises the pre-action snapshot is used to roll back the change automatically.
 
-A companion **comparative evaluation framework** (`eval/`) lets you run all four methods — rule-based, Random Forest, LLM-without-RAG, and LLM+RAG — on identical fault instances and compare them across four measurable hypotheses (H1 diagnosis accuracy, H2 remediation quality, H3 novel-fault handling, H4 latency/cost).
+A companion **comparative evaluation framework** (`eval/`) lets you compare rule-based and Random Forest baselines, Gemini with/without RAG, and evaluation-only fine-tuned local Qwen 3B/7B models on identical fault instances. The local adapters are only loaded by the evaluation harness and do not affect daemon inference.
 
 ---
 
@@ -272,9 +272,9 @@ Example terminal output:
 
 ## 11. Comparative Evaluation Framework
 
-The `eval/` package implements a rigorous experiment comparing four methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
+The `eval/` package compares six methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
 
-### Four methods
+### Six methods
 
 | Method | Description | API calls | Latency |
 |---|---|---|---|
@@ -282,6 +282,47 @@ The `eval/` package implements a rigorous experiment comparing four methods on t
 | `ml` | Random Forest over 7 numeric features | 0 | ~10 ms |
 | `llm_no_rag` | Gemini with **no runbook context** (ablation) | 1–2 | 1–5 s |
 | `llm_rag` | Gemini + RAG-retrieved runbook chunks | 1–2 | 1–5 s |
+| `finetuned_3b` | Local Qwen2.5-3B-Instruct with the fine-tuned LoRA adapter | 0 | Hardware-dependent |
+| `finetuned_7b` | Local Qwen2.5-7B-Instruct with the fine-tuned LoRA adapter | 0 | Hardware-dependent |
+
+The Random Forest baseline's deterministic synthetic training data is created
+the first time `ml` is run and saved to
+`eval/data/ml_baseline_training.json`. Later runs load this same file rather
+than regenerating the 160 samples. To intentionally regenerate it, remove the
+JSON file and run an evaluation that includes `ml`; the generator uses seed 42.
+
+The local adapters live under `finetuning/`: `finetuned_3b` uses
+`qwen-k8s-diagnosis-3b/final`; `finetuned_7b` uses
+`qwen-k8s-diagnosis-7b/checkpoint-252`. Both base models are fetched from the
+Hugging Face cache or Hub as needed. Local evaluation uses 4-bit NF4 weights,
+FP16 compute, and automatic CPU placement to limit GPU memory use. On a 4 GB
+GPU, the default GPU budget is 3072 MiB with 512 MiB reserved; the 7B model may
+spill to system RAM and run slowly. A CUDA-enabled PyTorch build compatible with
+the NVIDIA driver, plus the Transformers, Accelerate, PEFT, and bitsandbytes
+dependencies, is required.
+
+The local models run without RAG and receive the same incident prompt template
+as the remote no-RAG baseline. The harness loads one local adapter at a time
+and processes its trials before switching adapters.
+
+Optional local inference controls:
+
+| Environment variable | Default | Purpose |
+|---|---:|---|
+| `EVAL_LOCAL_GPU_MEMORY_MIB` | `3072` | Upper GPU memory budget |
+| `EVAL_LOCAL_GPU_RESERVE_MIB` | `512` | VRAM left free for other processes |
+| `EVAL_LOCAL_MAX_INPUT_TOKENS` | `2048` | Maximum prompt length |
+| `EVAL_LOCAL_MAX_NEW_TOKENS` | `256` | Maximum generated response |
+| `EVAL_LOCAL_DEBUG_RAW` | unset | Print generated text and EOS/token-count diagnostics |
+
+To inspect malformed local-model output, enable raw-response diagnostics for a
+single-trial run, for example:
+
+```bash
+EVAL_LOCAL_DEBUG_RAW=1 python -m eval.harness --scenarios known --methods finetuned_3b --trials 1 --output eval/results/finetuned_3b_debug.jsonl
+```
+
+Raw output can echo incident details; keep captured debug logs private.
 
 ### Hypotheses tested
 
@@ -290,7 +331,7 @@ The `eval/` package implements a rigorous experiment comparing four methods on t
 | **H1** | Diagnosis accuracy (% correct category) | Baselines ≈ 100% on known faults; LLM wins on ambiguous signals |
 | **H2** | Remediation quality (unsafe-action rate) | All equal — same allow-list enforced for every method |
 | **H3** | Novel fault accuracy | Baselines ≈ 0%; LLM+RAG > LLM-no-RAG > 0% |
-| **H4** | Latency and API cost per incident | Baselines win on cost; LLM wins on quality |
+| **H4** | Latency and API cost per incident | Local inference has no API charge; report its hardware-dependent latency separately |
 
 ### Fault scenarios
 
@@ -330,6 +371,9 @@ python -m eval.harness --trials 20 --scenarios novel --methods llm_no_rag llm_ra
 
 # Full evaluation:
 python -m eval.harness --trials 20 --output eval/results/full_run.jsonl
+
+# Include both local fine-tuned models in a comparison:
+python -m eval.harness --methods rule_based ml llm_no_rag llm_rag finetuned_3b finetuned_7b --trials 5 --output eval/results/local_comparison.jsonl
 
 # Analyse and produce a paper-ready Markdown table:
 python -m eval.analyze_results eval/results/full_run.jsonl --format md --output eval/results/report.md
@@ -398,6 +442,7 @@ self-healing-daemon/
 │   ├── rule_based.py            # Rule-table baseline (< 1 ms, 0 API calls)
 │   ├── ml_baseline.py           # Random Forest baseline (scikit-learn)
 │   ├── llm_methods.py           # LLM-no-RAG and LLM+RAG wrappers
+│   ├── local_llm_methods.py     # Evaluation-only Qwen LoRA inference
 │   ├── harness.py               # Orchestrator — runs all methods, writes JSONL
 │   ├── analyze_results.py       # H1–H4 statistics, CI, confusion matrices
 │   ├── safety_probe.py          # Adversarial safety probing (10 probes, H5)

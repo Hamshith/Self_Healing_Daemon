@@ -47,6 +47,7 @@ eval/results/safety_probe*_summary.json
 eval/results/*.pkl
 eval/results/*.joblib
 /finetuning/qwen-k8s-diagnosis-3b/
+/finetuning/qwen-k8s-diagnosis-7b/
 /dataset/
 
 # ── Miscellaneous ───────────────────────────────────────────────────────────

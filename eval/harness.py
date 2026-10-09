@@ -3,7 +3,7 @@ eval/harness.py — Main evaluation orchestrator.
 
 Usage
 ─────
-    # Run all scenarios, all methods, 5 trials each (quick smoke-test):
+    # Run the existing baselines, 5 trials each (quick smoke-test):
     python -m eval.harness --trials 5 --output eval/results/run_001.jsonl
 
     # Full evaluation, 20 trials:
@@ -12,10 +12,13 @@ Usage
     # Known-fault scenarios only (no novel, no LLM calls):
     python -m eval.harness --scenarios known --methods rule_based ml --trials 20
 
-    # Novel faults only, LLM methods only:
+    # Novel faults only, remote LLM methods only:
     python -m eval.harness --scenarios novel --methods llm_no_rag llm_rag --trials 5
 
-    # Dry-run: builds incident dicts but skips LLM API calls:
+    # Compare the local 3B adapter with the other baselines:
+    python -m eval.harness --methods rule_based ml llm_no_rag finetuned_3b
+
+    # Dry-run: builds incident dicts but skips LLM inference:
     python -m eval.harness --dry-run --trials 3
 
 Controls enforced by the harness
@@ -24,7 +27,7 @@ Controls enforced by the harness
     receives different signals.
   • Same safety allow-list for all methods (from eval.types.SAFE_ACTIONS).
   • RAG query for llm_rag deliberately excludes the fault_type label.
-  • Model version and temperature are read from config.MODEL and EVAL_TEMPERATURE.
+  • Remote model version and temperature are read from config.MODEL and EVAL_TEMPERATURE.
   • Results are written as JSONL so the file survives partial runs; each trial
     is flushed immediately after completion.
 """
@@ -56,7 +59,9 @@ import eval.ml_baseline as ml_baseline
 
 DEFAULT_TRIALS = 20
 DEFAULT_OUTPUT = "eval/results/run_{timestamp}.jsonl"
-ALL_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
+LOCAL_LLM_METHODS = {"finetuned_3b", "finetuned_7b"}
+DEFAULT_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
+ALL_METHODS = DEFAULT_METHODS + ["finetuned_3b", "finetuned_7b"]
 
 # Seconds to wait between consecutive LLM calls to avoid rate-limiting.
 LLM_INTER_CALL_SLEEP = float(os.getenv("EVAL_LLM_SLEEP", "2.0"))
@@ -163,13 +168,15 @@ def _run_trial(
     trial_index: int,
     methods: list[str],
     dry_run: bool = False,
+    incident: Optional[dict] = None,
 ) -> list[EvalResult]:
     """
     Run all requested methods on a single trial of a single scenario.
 
     Returns a list of EvalResults (one per method).
     """
-    incident = _build_incident_from_scenario(scenario, trial_index)
+    if incident is None:
+        incident = _build_incident_from_scenario(scenario, trial_index)
     results: list[EvalResult] = []
 
     for method in methods:
@@ -209,6 +216,16 @@ def _run_trial(
                 )
                 time.sleep(LLM_INTER_CALL_SLEEP)
 
+        elif method in LOCAL_LLM_METHODS:
+            if dry_run:
+                r = _stub_result(method, scenario, trial_index)
+            else:
+                from eval.local_llm_methods import diagnose_local
+                r = diagnose_local(
+                    method, incident, trial_index,
+                    scenario.ground_truth_category, scenario.is_novel,
+                )
+
         else:
             print(f"[harness] Unknown method: {method}, skipping")
             continue
@@ -224,7 +241,7 @@ def _run_trial(
 
 
 def _stub_result(method: str, scenario: ScenarioSpec, trial_index: int) -> EvalResult:
-    """Return a placeholder EvalResult for dry-runs (no API calls made)."""
+    """Return a placeholder EvalResult for dry-runs (no LLM inference made)."""
     from eval.types import SAFE_ACTIONS
     return EvalResult(
         method=method,
@@ -239,7 +256,7 @@ def _stub_result(method: str, scenario: ScenarioSpec, trial_index: int) -> EvalR
         latency_ms=0.0,
         api_cost_usd=0.0,
         confidence="N/A",
-        root_cause="DRY_RUN — no API call made",
+        root_cause="DRY_RUN — no LLM inference made",
         explanation="",
         retrieval_mode="N/A",
     )
@@ -299,10 +316,21 @@ def run(
     all_results: list[EvalResult] = []
     total = len(scenarios) * n_trials * len(methods)
     done = 0
+    local_methods = [method for method in methods if method in LOCAL_LLM_METHODS]
+    non_local_methods = [
+        method for method in methods if method not in LOCAL_LLM_METHODS
+    ]
+    trial_incidents: list[tuple[ScenarioSpec, int, dict]] = []
+    local_model_metadata = {}
+    if local_methods:
+        from eval.local_llm_methods import get_local_model_metadata
+
+        local_model_metadata = get_local_model_metadata(local_methods)
 
     run_meta = {
         "harness_version": "1.0.0",
         "model": config.MODEL,
+        "local_models": local_model_metadata,
         "n_trials": n_trials,
         "methods": methods,
         "scenarios": [s.name for s in scenarios],
@@ -315,20 +343,52 @@ def run(
         fh.write(json.dumps({"type": "meta", **run_meta}) + "\n")
         fh.flush()
 
+        def record_results(trial_results: list[EvalResult]) -> None:
+            nonlocal done
+            for result in trial_results:
+                fh.write(json.dumps(_result_to_dict(result)) + "\n")
+                fh.flush()
+                all_results.append(result)
+                done += 1
+
         for scenario in scenarios:
             print(f"\n[harness] Scenario: {scenario.name} "
                   f"(novel={scenario.is_novel}, truth={scenario.ground_truth_category})")
 
             for trial_index in range(n_trials):
-                trial_results = _run_trial(scenario, trial_index, methods, dry_run)
-                for r in trial_results:
-                    row = _result_to_dict(r)
-                    fh.write(json.dumps(row) + "\n")
-                    fh.flush()
-                    all_results.append(r)
-                    done += len(trial_results)
+                incident = _build_incident_from_scenario(scenario, trial_index)
+                trial_incidents.append((scenario, trial_index, incident))
+                trial_results = _run_trial(
+                    scenario, trial_index, non_local_methods, dry_run, incident
+                )
+                record_results(trial_results)
 
                 print(f"  [harness] {done}/{total} calls done")
+
+        if local_methods and not dry_run:
+            from eval.local_llm_methods import release_local_model
+
+            try:
+                for method in local_methods:
+                    print(f"\n[harness] Evaluating {method} across all trials")
+                    for scenario, trial_index, incident in trial_incidents:
+                        trial_results = _run_trial(
+                            scenario, trial_index, [method], incident=incident
+                        )
+                        record_results(trial_results)
+                        print(f"  [harness] {done}/{total} calls done")
+            finally:
+                release_local_model()
+        elif local_methods:
+            for method in local_methods:
+                for scenario, trial_index, incident in trial_incidents:
+                    record_results(
+                        _run_trial(
+                            scenario, trial_index, [method], dry_run=True,
+                            incident=incident,
+                        )
+                    )
+                    print(f"  [harness] {done}/{total} calls done")
 
     print(f"\n[harness] Evaluation complete. {len(all_results)} results -> {output_path}")
     return all_results
@@ -351,9 +411,9 @@ def _parse_args(argv=None):
         help="Which scenario set to run (default: all)",
     )
     p.add_argument(
-        "--methods", nargs="+", default=ALL_METHODS,
+        "--methods", nargs="+", default=DEFAULT_METHODS,
         choices=ALL_METHODS,
-        help="Which methods to run (default: all four)",
+        help="Which methods to run (default: existing four methods)",
     )
     p.add_argument(
         "--output", default=None,
@@ -361,7 +421,7 @@ def _parse_args(argv=None):
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="Build incident dicts and run non-LLM methods; skip API calls",
+        help="Build incident dicts and skip all LLM inference",
     )
     return p.parse_args(argv)
 

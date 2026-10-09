@@ -1,9 +1,9 @@
 """
 eval/types.py — shared data structures for the evaluation harness.
 
-Every method (rule-based, ML, LLM-no-RAG, LLM+RAG) returns an EvalResult
-so the harness can compare them on identical fields without touching
-method-specific internals.
+Every method (rule-based, ML, remote LLM, or local fine-tuned LLM) returns an
+EvalResult so the harness can compare them on identical fields without
+touching method-specific internals.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -42,7 +42,7 @@ class EvalResult:
     apples-to-apples comparison across H1–H4.
     """
     # ── Identity ──────────────────────────────────────────────────────────
-    method: str                     # "rule_based" | "ml" | "llm_no_rag" | "llm_rag"
+    method: str                     # method identifier from eval.harness.ALL_METHODS
     fault_scenario: str             # e.g. "OOMKilled", "ReadinessFailure"
     trial_index: int                # 0-based trial number within the scenario
 
@@ -60,7 +60,7 @@ class EvalResult:
 
     # ── H4 — Cost ─────────────────────────────────────────────────────────
     latency_ms: float               # wall-clock time for this method call, ms
-    api_cost_usd: float             # estimated Gemini API cost; 0.0 for non-LLM methods
+    api_cost_usd: float             # estimated remote API cost; 0.0 for local inference
 
     # ── Optional fields filled by LLM methods ─────────────────────────────
     confidence: str = "N/A"         # "high" | "medium" | "low" | "N/A"
