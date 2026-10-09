@@ -4,12 +4,13 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
 from eval.llm_methods import _eval_result_from_diagnosis
-from eval.types import EvalResult
+from eval.types import EvalResult, VALID_CATEGORIES
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _MODEL_SPECS = {
@@ -163,13 +164,43 @@ def release_local_model() -> None:
 def _parse_response(raw_response: str) -> dict:
     import llm_client
 
+    cleaned = llm_client._strip_markdown_fences(raw_response)
     try:
-        diagnosis = json.loads(llm_client._strip_markdown_fences(raw_response))
+        diagnosis = json.loads(cleaned)
     except json.JSONDecodeError:
-        diagnosis = None
+        try:
+            diagnosis, _ = json.JSONDecoder().raw_decode(cleaned.lstrip())
+        except json.JSONDecodeError:
+            diagnosis = None
 
     if isinstance(diagnosis, dict):
         return diagnosis
+
+    category_match = re.search(
+        r'"root_cause_category"\s*:\s*"([^"]+)"',
+        cleaned,
+    )
+    partial_category = category_match.group(1) if category_match else None
+    if partial_category in VALID_CATEGORIES:
+        return {
+            "root_cause": "Recovered category from incomplete model output.",
+            "root_cause_category": partial_category,
+            "confidence": "low",
+            "explanation": (
+                "The model response was truncated or malformed; only the "
+                "category was recovered. Remediation requires human review."
+            ),
+            "remediation_steps": [
+                {
+                    "step": 1,
+                    "action": "escalate",
+                    "reason": "The model response was incomplete and could not be validated.",
+                    "parameters": {},
+                }
+            ],
+            "safe_to_auto_remediate": False,
+        }
+
     return {
         "root_cause": "The fine-tuned model did not return a JSON diagnosis.",
         "root_cause_category": "Unknown",
@@ -202,6 +233,13 @@ def diagnose_local(
         "runbook_context": "(no runbook context — local fine-tuned model evaluation)",
     }
     user_prompt = llm_client._build_user_prompt(no_rag_incident)
+    user_prompt += (
+        "\n\nLOCAL EVALUATION OUTPUT REQUIREMENTS:\n"
+        "- Return exactly one complete JSON object and stop immediately after its closing brace.\n"
+        "- Keep root_cause, error, explanation, and each evidence item concise.\n"
+        "- Include exactly one evidence item and exactly one remediation step.\n"
+        "- Do not add markdown, commentary, or special tokens after the JSON object."
+    )
     encoded_prompt = tokenizer.apply_chat_template(
         [
             {"role": "system", "content": llm_client.SYSTEM_PROMPT},
@@ -234,7 +272,7 @@ def diagnose_local(
 
     input_device = model.get_input_embeddings().weight.device
     input_ids = input_ids.to(input_device)
-    max_new_tokens = int(os.getenv("EVAL_LOCAL_MAX_NEW_TOKENS", "256"))
+    max_new_tokens = int(os.getenv("EVAL_LOCAL_MAX_NEW_TOKENS", "384"))
     if max_new_tokens <= 0:
         raise ValueError("EVAL_LOCAL_MAX_NEW_TOKENS must be positive.")
 

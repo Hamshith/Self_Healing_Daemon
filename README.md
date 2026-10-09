@@ -312,7 +312,7 @@ Optional local inference controls:
 | `EVAL_LOCAL_GPU_MEMORY_MIB` | `3072` | Upper GPU memory budget |
 | `EVAL_LOCAL_GPU_RESERVE_MIB` | `512` | VRAM left free for other processes |
 | `EVAL_LOCAL_MAX_INPUT_TOKENS` | `2048` | Maximum prompt length |
-| `EVAL_LOCAL_MAX_NEW_TOKENS` | `256` | Maximum generated response |
+| `EVAL_LOCAL_MAX_NEW_TOKENS` | `384` | Maximum generated response |
 | `EVAL_LOCAL_DEBUG_RAW` | unset | Print generated text and EOS/token-count diagnostics |
 
 To inspect malformed local-model output, enable raw-response diagnostics for a
@@ -323,6 +323,10 @@ EVAL_LOCAL_DEBUG_RAW=1 python -m eval.harness --scenarios known --methods finetu
 ```
 
 Raw output can echo incident details; keep captured debug logs private.
+If Kubernetes enrichment fails, known-fault scenarios use deterministic
+scenario-specific pod statuses, events, and logs rather than empty inputs.
+Incomplete JSON may still contribute a recovered category, but its confidence
+is low and its action is always `escalate`.
 
 ### Hypotheses tested
 

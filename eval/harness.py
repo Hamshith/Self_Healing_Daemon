@@ -101,6 +101,150 @@ def _build_incident_from_scenario(scenario: ScenarioSpec, trial_index: int) -> d
     return base
 
 
+def _apply_scenario_stub_signals(incident: dict, scenario: ScenarioSpec) -> None:
+    """Add deterministic observable signals when live cluster data is absent."""
+    fault_type = scenario.detector_fault_type
+    if not incident.get("recent_logs"):
+        incident["recent_logs"] = scenario.synthetic_logs
+    if not incident.get("container_statuses"):
+        incident["container_statuses"] = []
+
+    if fault_type == "ApplicationCrash":
+        incident["restart_count"] = max(incident.get("restart_count", 0), 3)
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 3,
+                    "state": {
+                        "waiting": {
+                            "reason": "CrashLoopBackOff",
+                            "message": (
+                                "Container repeatedly exited with a non-zero status."
+                            ),
+                        },
+                        "last_state": {
+                            "terminated": {"reason": "Error", "exit_code": 1},
+                        },
+                    },
+                },
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = "ERROR Application process exited with code 1."
+    elif fault_type == "OOMKilled":
+        incident["restart_count"] = max(incident.get("restart_count", 0), 2)
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 2,
+                    "state": {
+                        "terminated": {"reason": "OOMKilled", "exit_code": 137},
+                    },
+                },
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = "Container terminated with exit code 137 (OOMKilled)."
+        if not any(
+            event.get("reason") == "OOMKilled"
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "OOMKilled",
+                    "message": "Container exceeded its memory limit and was killed.",
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "ImagePullError":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 0,
+                    "state": {
+                        "waiting": {
+                            "reason": "ImagePullBackOff",
+                            "message": "The requested container image could not be pulled.",
+                        },
+                    },
+                },
+            ]
+        if not any(
+            "pull image" in event.get("message", "").lower()
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "Failed",
+                    "message": "Failed to pull image: manifest not found.",
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "ConfigError":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 0,
+                    "state": {
+                        "waiting": {
+                            "reason": "CreateContainerConfigError",
+                            "message": "Required Secret or ConfigMap was not found.",
+                        },
+                    },
+                },
+            ]
+        if not any(
+            "configerror" in event.get("message", "").lower()
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "Failed",
+                    "message": (
+                        "CreateContainerConfigError: referenced Secret or ConfigMap "
+                        "does not exist."
+                    ),
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "CPUThrottle":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restart_count": 0,
+                    "state": {},
+                }
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = (
+                "CPU usage is at the configured container limit; throttled CPU "
+                "periods are elevated."
+            )
+    elif fault_type == "NetworkLatency":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restart_count": 0,
+                    "state": {},
+                }
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = (
+                "Network probe reports elevated round-trip latency of 400 ms; "
+                "packet loss is not detected."
+            )
+
+
 def _enrich_from_cluster(incident: dict, scenario: ScenarioSpec) -> dict:
     """
     Attempt to collect real pod signals from the cluster.
@@ -156,7 +300,11 @@ def _enrich_from_cluster(incident: dict, scenario: ScenarioSpec) -> dict:
             max((s["restart_count"] for s in statuses), default=0) if statuses else 0
         )
     except Exception as exc:
-        print(f"[harness] Cluster enrichment failed ({exc}); using stub incident")
+        _apply_scenario_stub_signals(incident, scenario)
+        print(
+            f"[harness] Cluster enrichment failed ({exc}); "
+            "using deterministic scenario stub signals"
+        )
 
     return incident
 
