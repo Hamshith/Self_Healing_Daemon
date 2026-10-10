@@ -49,6 +49,7 @@ eval/results/*.joblib
 /finetuning/qwen-k8s-diagnosis-3b/
 /finetuning/qwen-k8s-diagnosis-7b/
 /dataset/
+eval/data/*
 
 # ── Miscellaneous ───────────────────────────────────────────────────────────
 IMPLEMENTATION_NOTES.md
