@@ -59,15 +59,28 @@ import eval.ml_baseline as ml_baseline
 
 DEFAULT_TRIALS = 20
 DEFAULT_OUTPUT = "eval/results/run_{timestamp}.jsonl"
-LOCAL_RAG_METHODS = {"finetuned_3b_rag", "finetuned_7b_rag"}
-LOCAL_LLM_METHODS = {
+FINETUNED_LOCAL_METHODS = {
     "finetuned_3b", "finetuned_3b_rag",
     "finetuned_7b", "finetuned_7b_rag",
 }
+BASE_LOCAL_METHODS = {"base_3b", "base_3b_rag", "base_7b", "base_7b_rag"}
+LOCAL_LLM_METHODS = FINETUNED_LOCAL_METHODS | BASE_LOCAL_METHODS
+LOCAL_RAG_METHODS = {
+    "finetuned_3b_rag", "finetuned_7b_rag",
+    "base_3b_rag", "base_7b_rag",
+}
+LOCAL_MODEL_GROUPS = [
+    ("finetuned_3b", "finetuned_3b_rag"),
+    ("base_3b", "base_3b_rag"),
+    ("finetuned_7b", "finetuned_7b_rag"),
+    ("base_7b", "base_7b_rag"),
+]
 DEFAULT_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
 ALL_METHODS = DEFAULT_METHODS + [
     "finetuned_3b", "finetuned_3b_rag",
     "finetuned_7b", "finetuned_7b_rag",
+    "base_3b", "base_3b_rag",
+    "base_7b", "base_7b_rag",
 ]
 
 # ── Incident builder ─────────────────────────────────────────────────────
@@ -365,11 +378,21 @@ def _run_trial(
                     scenario.ground_truth_category, scenario.is_novel,
                 )
 
-        elif method in LOCAL_LLM_METHODS:
+        elif method in FINETUNED_LOCAL_METHODS:
             if dry_run:
                 r = _stub_result(method, scenario, trial_index)
             else:
                 from eval.local_llm_methods import diagnose_local
+                r = diagnose_local(
+                    method, incident, trial_index,
+                    scenario.ground_truth_category, scenario.is_novel,
+                )
+
+        elif method in BASE_LOCAL_METHODS:
+            if dry_run:
+                r = _stub_result(method, scenario, trial_index)
+            else:
+                from eval.local_base_llm_methods import diagnose_local
                 r = diagnose_local(
                     method, incident, trial_index,
                     scenario.ground_truth_category, scenario.is_novel,
@@ -475,9 +498,28 @@ def run(
     trial_incidents: list[tuple[ScenarioSpec, int, dict]] = []
     local_model_metadata = {}
     if local_methods:
-        from eval.local_llm_methods import get_local_model_metadata
+        if any(method in FINETUNED_LOCAL_METHODS for method in local_methods):
+            from eval.local_llm_methods import (
+                get_local_model_metadata as get_finetuned_model_metadata,
+            )
 
-        local_model_metadata = get_local_model_metadata(local_methods)
+            finetuned_methods = [
+                method for method in local_methods
+                if method in FINETUNED_LOCAL_METHODS
+            ]
+            local_model_metadata.update(
+                get_finetuned_model_metadata(finetuned_methods)
+            )
+        if any(method in BASE_LOCAL_METHODS for method in local_methods):
+            from eval.local_base_llm_methods import (
+                get_local_model_metadata as get_base_model_metadata,
+            )
+
+            base_methods = [
+                method for method in local_methods
+                if method in BASE_LOCAL_METHODS
+            ]
+            local_model_metadata.update(get_base_model_metadata(base_methods))
 
     run_meta = {
         "harness_version": "1.0.0",
@@ -518,19 +560,43 @@ def run(
                 print(f"  [harness] {done}/{total} calls done")
 
         if local_methods and not dry_run:
-            from eval.local_llm_methods import release_local_model
+            from eval.local_llm_methods import (
+                release_local_model as release_finetuned_model,
+            )
+            from eval.local_base_llm_methods import (
+                release_local_model as release_base_model,
+            )
 
             try:
-                for method in local_methods:
-                    print(f"\n[harness] Evaluating {method} across all trials")
-                    for scenario, trial_index, incident in trial_incidents:
-                        trial_results = _run_trial(
-                            scenario, trial_index, [method], incident=incident
-                        )
-                        record_results(trial_results)
-                        print(f"  [harness] {done}/{total} calls done")
+                selected_model_groups = [
+                    tuple(method for method in local_methods if method in model_group)
+                    for model_group in LOCAL_MODEL_GROUPS
+                ]
+                selected_model_groups = [
+                    group for group in selected_model_groups if group
+                ]
+                selected_model_groups.sort(
+                    key=lambda group: min(local_methods.index(method) for method in group)
+                )
+                for selected_group in selected_model_groups:
+
+                    # Only one model family/size is resident at a time on a
+                    # constrained GPU; RAG and no-RAG variants share weights.
+                    release_finetuned_model()
+                    release_base_model()
+                    for method in selected_group:
+                        print(f"\n[harness] Evaluating {method} across all trials")
+                        for scenario, trial_index, incident in trial_incidents:
+                            trial_results = _run_trial(
+                                scenario, trial_index, [method], incident=incident
+                            )
+                            record_results(trial_results)
+                            print(f"  [harness] {done}/{total} calls done")
+                    release_finetuned_model()
+                    release_base_model()
             finally:
-                release_local_model()
+                release_finetuned_model()
+                release_base_model()
         elif local_methods:
             for method in local_methods:
                 for scenario, trial_index, incident in trial_incidents:

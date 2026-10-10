@@ -4,7 +4,7 @@ A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Ku
 
 Gemini returns an ordered `remediation_steps` list with an allow-listed action for each step. The remediator executes only supported Kubernetes operations (`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is true; human-only work is returned as `escalate`. After every successful remediation the daemon **polls the pod for up to 2 minutes** and only records the incident as remediated once the pod is stable. If it never stabilises the pre-action snapshot is used to roll back the change automatically.
 
-A companion **comparative evaluation framework** (`eval/`) lets you compare rule-based and Random Forest baselines, Gemini with/without RAG, and evaluation-only fine-tuned local Qwen 3B/7B models on identical fault instances. The local adapters are only loaded by the evaluation harness and do not affect daemon inference.
+A companion **comparative evaluation framework** (`eval/`) lets you compare rule-based and Random Forest baselines, Gemini with/without RAG, and evaluation-only fine-tuned and untuned local Qwen 3B/7B models on identical fault instances. Local models are only loaded by the evaluation harness and do not affect daemon inference.
 
 ---
 
@@ -272,9 +272,9 @@ Example terminal output:
 
 ## 11. Comparative Evaluation Framework
 
-The `eval/` package compares eight methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
+The `eval/` package compares twelve methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
 
-### Eight methods
+### Methods
 
 | Method | Description | API calls | Latency |
 |---|---|---|---|
@@ -286,6 +286,10 @@ The `eval/` package compares eight methods on the same fault instances. This is 
 | `finetuned_3b_rag` | Local fine-tuned Qwen 3B with RAG | 0 | Hardware-dependent |
 | `finetuned_7b` | Local fine-tuned Qwen 7B without RAG | 0 | Hardware-dependent |
 | `finetuned_7b_rag` | Local fine-tuned Qwen 7B with RAG | 0 | Hardware-dependent |
+| `base_3b` | Untuned Qwen 3B instruct model without RAG | 0 | Hardware-dependent |
+| `base_3b_rag` | Untuned Qwen 3B instruct model with RAG | 0 | Hardware-dependent |
+| `base_7b` | Untuned Qwen 7B instruct model without RAG | 0 | Hardware-dependent |
+| `base_7b_rag` | Untuned Qwen 7B instruct model with RAG | 0 | Hardware-dependent |
 
 The Random Forest baseline's deterministic synthetic training data is created
 the first time `ml` is run and saved to
@@ -303,15 +307,28 @@ spill to system RAM and run slowly. A CUDA-enabled PyTorch build compatible with
 the NVIDIA driver, plus the Transformers, Accelerate, PEFT, and bitsandbytes
 dependencies, is required.
 
-Each local model has a no-RAG method and a `_rag` counterpart. The RAG variants
+The untuned methods load `Qwen/Qwen2.5-3B-Instruct` and
+`Qwen/Qwen2.5-7B-Instruct` directly, without loading a PEFT/LoRA adapter. They
+use the same 4-bit NF4, FP16 compute, and automatic CPU placement strategy.
+Their method IDs begin with `base_`; the `finetuned_` methods remain separate
+so results can be compared without changing daemon inference.
+
+Each fine-tuned and untuned local model has a no-RAG method and a `_rag` counterpart. The RAG variants
 use the same log/event-based query as Gemini's `llm_rag` method, retrieve up to
 three runbook chunks, and do not include the detector's fault-type label in
 the query. Both local variants use the same incident prompt structure. The
-harness loads one local adapter at a time and processes its trials before
-switching adapters. Select both variants to compare them, for example:
+harness reuses loaded weights for each model's RAG/no-RAG pair and keeps only
+one local model resident at a time. Select both variants to compare them, for
+example:
 
 ```bash
 python -m eval.harness --methods finetuned_3b finetuned_3b_rag --trials 5 --output eval/results/qwen_3b_rag_comparison.jsonl
+```
+
+Compare the untuned 3B base model with and without retrieval:
+
+```bash
+python -m eval.harness --methods base_3b base_3b_rag --trials 5 --output eval/results/qwen_base_3b_rag_comparison.jsonl
 ```
 
 Gemini-backed evaluation calls are paced at a maximum of 15 requests per
@@ -392,8 +409,9 @@ python -m eval.harness --trials 20 --scenarios novel --methods llm_no_rag llm_ra
 # Full evaluation:
 python -m eval.harness --trials 20 --output eval/results/full_run.jsonl
 
-# Include all local fine-tuned models with and without RAG:
+# Include all fine-tuned and untuned local models with and without RAG:
 python -m eval.harness --methods finetuned_3b finetuned_3b_rag finetuned_7b finetuned_7b_rag --trials 5 --output eval/results/local_comparison.jsonl
+python -m eval.harness --methods base_3b base_3b_rag base_7b base_7b_rag --trials 5 --output eval/results/base_comparison.jsonl
 
 # Analyse and produce a paper-ready Markdown table:
 python -m eval.analyze_results eval/results/full_run.jsonl --format md --output eval/results/report.md

@@ -212,7 +212,7 @@ def _parse_response(raw_response: str) -> dict:
         }
 
     return {
-        "root_cause": "The fine-tuned model did not return a JSON diagnosis.",
+        "root_cause": "The local model did not return a JSON diagnosis.",
         "root_cause_category": "Unknown",
         "confidence": "low",
         "explanation": "The response was not a JSON object in the expected format.",
