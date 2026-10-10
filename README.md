@@ -304,8 +304,8 @@ Hugging Face cache or Hub as needed. Local evaluation uses 4-bit NF4 weights,
 FP16 compute, and automatic CPU placement to limit GPU memory use. On a 4 GB
 GPU, the default GPU budget is 3072 MiB with 512 MiB reserved; the 7B model may
 spill to system RAM and run slowly. A CUDA-enabled PyTorch build compatible with
-the NVIDIA driver, plus the Transformers, Accelerate, PEFT, and bitsandbytes
-dependencies, is required.
+the NVIDIA driver, plus Transformers, Accelerate, and bitsandbytes, is required.
+PEFT is additionally required for the fine-tuned adapter methods.
 
 The untuned methods load `Qwen/Qwen2.5-3B-Instruct` and
 `Qwen/Qwen2.5-7B-Instruct` directly, without loading a PEFT/LoRA adapter. They
