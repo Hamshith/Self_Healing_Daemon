@@ -272,9 +272,9 @@ Example terminal output:
 
 ## 11. Comparative Evaluation Framework
 
-The `eval/` package compares six methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
+The `eval/` package compares eight methods on the same fault instances. This is the experiment required to back any claim that the LLM+RAG approach is better than simpler alternatives.
 
-### Six methods
+### Eight methods
 
 | Method | Description | API calls | Latency |
 |---|---|---|---|
@@ -282,8 +282,10 @@ The `eval/` package compares six methods on the same fault instances. This is th
 | `ml` | Random Forest over 7 numeric features | 0 | ~10 ms |
 | `llm_no_rag` | Gemini with **no runbook context** (ablation) | 1–2 | 1–5 s |
 | `llm_rag` | Gemini + RAG-retrieved runbook chunks | 1–2 | 1–5 s |
-| `finetuned_3b` | Local Qwen2.5-3B-Instruct with the fine-tuned LoRA adapter | 0 | Hardware-dependent |
-| `finetuned_7b` | Local Qwen2.5-7B-Instruct with the fine-tuned LoRA adapter | 0 | Hardware-dependent |
+| `finetuned_3b` | Local fine-tuned Qwen 3B without RAG | 0 | Hardware-dependent |
+| `finetuned_3b_rag` | Local fine-tuned Qwen 3B with RAG | 0 | Hardware-dependent |
+| `finetuned_7b` | Local fine-tuned Qwen 7B without RAG | 0 | Hardware-dependent |
+| `finetuned_7b_rag` | Local fine-tuned Qwen 7B with RAG | 0 | Hardware-dependent |
 
 The Random Forest baseline's deterministic synthetic training data is created
 the first time `ml` is run and saved to
@@ -301,9 +303,23 @@ spill to system RAM and run slowly. A CUDA-enabled PyTorch build compatible with
 the NVIDIA driver, plus the Transformers, Accelerate, PEFT, and bitsandbytes
 dependencies, is required.
 
-The local models run without RAG and receive the same incident prompt template
-as the remote no-RAG baseline. The harness loads one local adapter at a time
-and processes its trials before switching adapters.
+Each local model has a no-RAG method and a `_rag` counterpart. The RAG variants
+use the same log/event-based query as Gemini's `llm_rag` method, retrieve up to
+three runbook chunks, and do not include the detector's fault-type label in
+the query. Both local variants use the same incident prompt structure. The
+harness loads one local adapter at a time and processes its trials before
+switching adapters. Select both variants to compare them, for example:
+
+```bash
+python -m eval.harness --methods finetuned_3b finetuned_3b_rag --trials 5 --output eval/results/qwen_3b_rag_comparison.jsonl
+```
+
+Gemini-backed evaluation calls are paced at a maximum of 15 requests per
+minute by default. The limiter applies to each actual API attempt, including
+JSON retries and safety probes. Set `EVAL_GEMINI_RPM` to a lower positive
+integer if your account's applicable limit is lower. The limiter is
+process-local, so avoid running multiple Gemini evaluation processes
+simultaneously if they share the same quota.
 
 Optional local inference controls:
 
@@ -376,8 +392,8 @@ python -m eval.harness --trials 20 --scenarios novel --methods llm_no_rag llm_ra
 # Full evaluation:
 python -m eval.harness --trials 20 --output eval/results/full_run.jsonl
 
-# Include both local fine-tuned models in a comparison:
-python -m eval.harness --methods rule_based ml llm_no_rag llm_rag finetuned_3b finetuned_7b --trials 5 --output eval/results/local_comparison.jsonl
+# Include all local fine-tuned models with and without RAG:
+python -m eval.harness --methods finetuned_3b finetuned_3b_rag finetuned_7b finetuned_7b_rag --trials 5 --output eval/results/local_comparison.jsonl
 
 # Analyse and produce a paper-ready Markdown table:
 python -m eval.analyze_results eval/results/full_run.jsonl --format md --output eval/results/report.md

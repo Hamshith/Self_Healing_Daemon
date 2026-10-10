@@ -23,6 +23,13 @@ _MODEL_SPECS = {
         "adapter": _PROJECT_ROOT / "finetuning" / "qwen-k8s-diagnosis-7b" / "checkpoint-252",
     },
 }
+_LOCAL_METHOD_TO_MODEL = {
+    "finetuned_3b": "finetuned_3b",
+    "finetuned_3b_rag": "finetuned_3b",
+    "finetuned_7b": "finetuned_7b",
+    "finetuned_7b_rag": "finetuned_7b",
+}
+LOCAL_RAG_METHODS = {"finetuned_3b_rag", "finetuned_7b_rag"}
 
 _ACTIVE_METHOD: str | None = None
 _ACTIVE_MODEL: Any = None
@@ -34,13 +41,14 @@ def get_local_model_metadata(methods: list[str]) -> dict[str, dict[str, str]]:
     """Describe selected local base models and adapter checkpoints for run logs."""
     return {
         method: {
-            "base_model": _MODEL_SPECS[method]["base_model"],
+            "base_model": _MODEL_SPECS[_LOCAL_METHOD_TO_MODEL[method]]["base_model"],
             "adapter": (
-                Path(_MODEL_SPECS[method]["adapter"])
+                Path(_MODEL_SPECS[_LOCAL_METHOD_TO_MODEL[method]]["adapter"])
                 .relative_to(_PROJECT_ROOT)
                 .as_posix()
             ),
             "quantization": "4-bit NF4",
+            "retrieval": "RAG" if method in LOCAL_RAG_METHODS else "none",
         }
         for method in methods
     }
@@ -49,7 +57,8 @@ def get_local_model_metadata(methods: list[str]) -> dict[str, dict[str, str]]:
 def _load_model(method: str) -> tuple[Any, Any]:
     global _ACTIVE_METHOD, _ACTIVE_MODEL, _ACTIVE_TOKENIZER, _TORCH
 
-    spec = _MODEL_SPECS[method]
+    model_key = _LOCAL_METHOD_TO_MODEL[method]
+    spec = _MODEL_SPECS[model_key]
     adapter_path = Path(spec["adapter"])
     if not adapter_path.is_dir():
         raise FileNotFoundError(
@@ -133,7 +142,7 @@ def _load_model(method: str) -> tuple[Any, Any]:
     )
     model.eval()
 
-    _ACTIVE_METHOD = method
+    _ACTIVE_METHOD = model_key
     _ACTIVE_MODEL = model
     _ACTIVE_TOKENIZER = tokenizer
     _TORCH = torch
@@ -141,9 +150,10 @@ def _load_model(method: str) -> tuple[Any, Any]:
 
 
 def _get_model(method: str) -> tuple[Any, Any]:
-    if method not in _MODEL_SPECS:
+    if method not in _LOCAL_METHOD_TO_MODEL:
         raise ValueError(f"Unknown local evaluation method: {method}")
-    if _ACTIVE_METHOD != method or _ACTIVE_MODEL is None:
+    model_key = _LOCAL_METHOD_TO_MODEL[method]
+    if _ACTIVE_METHOD != model_key or _ACTIVE_MODEL is None:
         return _load_model(method)
     return _ACTIVE_MODEL, _ACTIVE_TOKENIZER
 
@@ -228,11 +238,20 @@ def diagnose_local(
     import llm_client
 
     model, tokenizer = _get_model(method)
-    no_rag_incident = {
+    if method in LOCAL_RAG_METHODS:
+        from eval.llm_methods import _retrieve_runbook_context
+
+        runbook_context, retrieval_mode = _retrieve_runbook_context(incident)
+    else:
+        runbook_context = (
+            "(no runbook context — local fine-tuned model evaluation)"
+        )
+        retrieval_mode = "none (local fine-tuned model)"
+    model_incident = {
         **incident,
-        "runbook_context": "(no runbook context — local fine-tuned model evaluation)",
+        "runbook_context": runbook_context,
     }
-    user_prompt = llm_client._build_user_prompt(no_rag_incident)
+    user_prompt = llm_client._build_user_prompt(model_incident)
     user_prompt += (
         "\n\nLOCAL EVALUATION OUTPUT REQUIREMENTS:\n"
         "- Return exactly one complete JSON object and stop immediately after its closing brace.\n"
@@ -319,5 +338,5 @@ def diagnose_local(
         latency_ms=latency_ms,
         input_tokens=0,
         output_tokens=0,
-        retrieval_mode="none (local fine-tuned model)",
+        retrieval_mode=retrieval_mode,
     )

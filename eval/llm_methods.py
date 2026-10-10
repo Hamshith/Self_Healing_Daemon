@@ -34,6 +34,7 @@ from typing import Optional
 import config
 import rag_engine
 
+from eval.gemini_rate_limit import wait_for_gemini_slot
 from eval.types import EvalResult, SAFE_ACTIONS
 
 # ── Pricing constants ─────────────────────────────────────────────────────
@@ -68,6 +69,7 @@ def _call_llm(incident: dict) -> tuple[dict, float, int, int]:
     temperature = float(os.getenv("EVAL_TEMPERATURE", "0.0"))
 
     def _call(prompt: str):
+        wait_for_gemini_slot()
         return client_obj.models.generate_content(
             model=config.MODEL,
             contents=prompt,
@@ -163,6 +165,20 @@ def _eval_result_from_diagnosis(
     )
 
 
+def _retrieve_runbook_context(incident: dict) -> tuple[str, str]:
+    """Retrieve runbook context without including the detector fault label."""
+    logs_snippet = str(incident.get("recent_logs", ""))[:200]
+    event_reasons = " ".join(
+        ev.get("reason", "") for ev in (incident.get("kubernetes_events") or [])
+    )
+    rag_query = (
+        f"{logs_snippet} {event_reasons}".strip()
+        or incident.get("pod_name", "incident")
+    )
+    chunks = rag_engine.retrieve(rag_query, top_k=3)
+    return rag_engine.format_context(chunks), rag_engine.get_retrieval_mode()
+
+
 # ── LLM without RAG ───────────────────────────────────────────────────────
 
 def diagnose_no_rag(incident: dict, trial_index: int, ground_truth_category: str,
@@ -216,19 +232,8 @@ def diagnose_rag(incident: dict, trial_index: int, ground_truth_category: str,
     and any kubernetes_events reason strings.  The fault_type label from the
     detector is withheld from the RAG query.
     """
-    # Build a query from log content and event reasons, NOT from fault_type.
-    # This is the control that prevents a reviewer from saying
-    # "retrieval just matches the fault name in the runbook."
-    logs_snippet = str(incident.get("recent_logs", ""))[:200]
-    event_reasons = " ".join(
-        ev.get("reason", "") for ev in (incident.get("kubernetes_events") or [])
-    )
-    rag_query = f"{logs_snippet} {event_reasons}".strip() or incident.get("pod_name", "incident")
-
-    # Retrieve runbook context without revealing the fault_type label.
-    chunks = rag_engine.retrieve(rag_query, top_k=3)
-    runbook_context = rag_engine.format_context(chunks)
-    retrieval_mode = rag_engine.get_retrieval_mode()
+    # The shared query builder intentionally excludes the detector fault type.
+    runbook_context, retrieval_mode = _retrieve_runbook_context(incident)
 
     incident_with_rag = {
         **incident,

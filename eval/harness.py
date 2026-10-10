@@ -15,8 +15,8 @@ Usage
     # Novel faults only, remote LLM methods only:
     python -m eval.harness --scenarios novel --methods llm_no_rag llm_rag --trials 5
 
-    # Compare the local 3B adapter with the other baselines:
-    python -m eval.harness --methods rule_based ml llm_no_rag finetuned_3b
+    # Compare the local 3B adapter with and without RAG:
+    python -m eval.harness --methods finetuned_3b finetuned_3b_rag
 
     # Dry-run: builds incident dicts but skips LLM inference:
     python -m eval.harness --dry-run --trials 3
@@ -59,13 +59,16 @@ import eval.ml_baseline as ml_baseline
 
 DEFAULT_TRIALS = 20
 DEFAULT_OUTPUT = "eval/results/run_{timestamp}.jsonl"
-LOCAL_LLM_METHODS = {"finetuned_3b", "finetuned_7b"}
+LOCAL_RAG_METHODS = {"finetuned_3b_rag", "finetuned_7b_rag"}
+LOCAL_LLM_METHODS = {
+    "finetuned_3b", "finetuned_3b_rag",
+    "finetuned_7b", "finetuned_7b_rag",
+}
 DEFAULT_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
-ALL_METHODS = DEFAULT_METHODS + ["finetuned_3b", "finetuned_7b"]
-
-# Seconds to wait between consecutive LLM calls to avoid rate-limiting.
-LLM_INTER_CALL_SLEEP = float(os.getenv("EVAL_LLM_SLEEP", "2.0"))
-
+ALL_METHODS = DEFAULT_METHODS + [
+    "finetuned_3b", "finetuned_3b_rag",
+    "finetuned_7b", "finetuned_7b_rag",
+]
 
 # ── Incident builder ─────────────────────────────────────────────────────
 
@@ -351,7 +354,6 @@ def _run_trial(
                     incident, trial_index,
                     scenario.ground_truth_category, scenario.is_novel,
                 )
-                time.sleep(LLM_INTER_CALL_SLEEP)
 
         elif method == "llm_rag":
             if dry_run:
@@ -362,7 +364,6 @@ def _run_trial(
                     incident, trial_index,
                     scenario.ground_truth_category, scenario.is_novel,
                 )
-                time.sleep(LLM_INTER_CALL_SLEEP)
 
         elif method in LOCAL_LLM_METHODS:
             if dry_run:
@@ -451,8 +452,11 @@ def run(
     """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure the RAG index is built once before any llm_rag calls.
-    if "llm_rag" in methods and not dry_run:
+    # Build the RAG index once for remote or local RAG methods.
+    if (
+        ("llm_rag" in methods or any(method in LOCAL_RAG_METHODS for method in methods))
+        and not dry_run
+    ):
         print("[harness] Building RAG index …")
         rag_engine.build_index()
 
