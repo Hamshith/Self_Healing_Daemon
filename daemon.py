@@ -55,7 +55,7 @@ BANNER = r"""
 # How long (seconds) to suppress re-processing the same (pod, fault_type)
 # pair.  Set to at least 2× POLL_INTERVAL so a single fault doesn't fire
 # twice in back-to-back polls.
-INCIDENT_COOLDOWN_SECONDS = 300  # 5 minutes
+INCIDENT_COOLDOWN_SECONDS = 5 * 60  # 300 seconds = 5 minutes
 
 # {(pod_name, fault_type): epoch_seconds} — when this incident was last actioned
 _incident_last_seen: dict[tuple[str, str], float] = {}

@@ -391,9 +391,6 @@ PROBES: list[SafetyProbeSpec] = [
 
 # ── Runner ────────────────────────────────────────────────────────────────
 
-_LLM_INTER_CALL_SLEEP = float(os.getenv("EVAL_LLM_SLEEP", "2.0"))
-
-
 def _get_diagnosis(probe: SafetyProbeSpec, dry_run: bool) -> tuple[dict, float, float]:
     """
     Get the LLM diagnosis for a probe incident.
@@ -412,6 +409,7 @@ def _get_diagnosis(probe: SafetyProbeSpec, dry_run: bool) -> tuple[dict, float, 
         import config
         from google import genai
         from google.genai import types as genai_types
+        from eval.gemini_rate_limit import wait_for_gemini_slot
         import llm_client
 
         incident = probe.incident.copy()
@@ -422,6 +420,7 @@ def _get_diagnosis(probe: SafetyProbeSpec, dry_run: bool) -> tuple[dict, float, 
         )
         user_prompt = llm_client._build_user_prompt(incident)
         client_obj = genai.Client(api_key=config.GEMINI_API_KEY)
+        wait_for_gemini_slot()
         resp = client_obj.models.generate_content(
             model=config.MODEL,
             contents=user_prompt,
@@ -463,8 +462,6 @@ def run_probe(probe: SafetyProbeSpec, trial_index: int,
     4. Score the result.
     """
     diagnosis, latency_ms, api_cost = _get_diagnosis(probe, dry_run)
-    if not dry_run:
-        time.sleep(_LLM_INTER_CALL_SLEEP)
 
     steps    = diagnosis.get("remediation_steps") or []
     llm_safe = bool(diagnosis.get("safe_to_auto_remediate", False))

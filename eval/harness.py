@@ -3,7 +3,7 @@ eval/harness.py — Main evaluation orchestrator.
 
 Usage
 ─────
-    # Run all scenarios, all methods, 5 trials each (quick smoke-test):
+    # Run the existing baselines, 5 trials each (quick smoke-test):
     python -m eval.harness --trials 5 --output eval/results/run_001.jsonl
 
     # Full evaluation, 20 trials:
@@ -12,10 +12,13 @@ Usage
     # Known-fault scenarios only (no novel, no LLM calls):
     python -m eval.harness --scenarios known --methods rule_based ml --trials 20
 
-    # Novel faults only, LLM methods only:
+    # Novel faults only, remote LLM methods only:
     python -m eval.harness --scenarios novel --methods llm_no_rag llm_rag --trials 5
 
-    # Dry-run: builds incident dicts but skips LLM API calls:
+    # Compare the local 3B adapter with and without RAG:
+    python -m eval.harness --methods finetuned_3b finetuned_3b_rag
+
+    # Dry-run: builds incident dicts but skips LLM inference:
     python -m eval.harness --dry-run --trials 3
 
 Controls enforced by the harness
@@ -24,7 +27,7 @@ Controls enforced by the harness
     receives different signals.
   • Same safety allow-list for all methods (from eval.types.SAFE_ACTIONS).
   • RAG query for llm_rag deliberately excludes the fault_type label.
-  • Model version and temperature are read from config.MODEL and EVAL_TEMPERATURE.
+  • Remote model version and temperature are read from config.MODEL and EVAL_TEMPERATURE.
   • Results are written as JSONL so the file survives partial runs; each trial
     is flushed immediately after completion.
 """
@@ -56,11 +59,29 @@ import eval.ml_baseline as ml_baseline
 
 DEFAULT_TRIALS = 20
 DEFAULT_OUTPUT = "eval/results/run_{timestamp}.jsonl"
-ALL_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
-
-# Seconds to wait between consecutive LLM calls to avoid rate-limiting.
-LLM_INTER_CALL_SLEEP = float(os.getenv("EVAL_LLM_SLEEP", "2.0"))
-
+FINETUNED_LOCAL_METHODS = {
+    "finetuned_3b", "finetuned_3b_rag",
+    "finetuned_7b", "finetuned_7b_rag",
+}
+BASE_LOCAL_METHODS = {"base_3b", "base_3b_rag", "base_7b", "base_7b_rag"}
+LOCAL_LLM_METHODS = FINETUNED_LOCAL_METHODS | BASE_LOCAL_METHODS
+LOCAL_RAG_METHODS = {
+    "finetuned_3b_rag", "finetuned_7b_rag",
+    "base_3b_rag", "base_7b_rag",
+}
+LOCAL_MODEL_GROUPS = [
+    ("finetuned_3b", "finetuned_3b_rag"),
+    ("base_3b", "base_3b_rag"),
+    ("finetuned_7b", "finetuned_7b_rag"),
+    ("base_7b", "base_7b_rag"),
+]
+DEFAULT_METHODS = ["rule_based", "ml", "llm_no_rag", "llm_rag"]
+ALL_METHODS = DEFAULT_METHODS + [
+    "finetuned_3b", "finetuned_3b_rag",
+    "finetuned_7b", "finetuned_7b_rag",
+    "base_3b", "base_3b_rag",
+    "base_7b", "base_7b_rag",
+]
 
 # ── Incident builder ─────────────────────────────────────────────────────
 
@@ -94,6 +115,150 @@ def _build_incident_from_scenario(scenario: ScenarioSpec, trial_index: int) -> d
         base = _enrich_from_cluster(base, scenario)
 
     return base
+
+
+def _apply_scenario_stub_signals(incident: dict, scenario: ScenarioSpec) -> None:
+    """Add deterministic observable signals when live cluster data is absent."""
+    fault_type = scenario.detector_fault_type
+    if not incident.get("recent_logs"):
+        incident["recent_logs"] = scenario.synthetic_logs
+    if not incident.get("container_statuses"):
+        incident["container_statuses"] = []
+
+    if fault_type == "ApplicationCrash":
+        incident["restart_count"] = max(incident.get("restart_count", 0), 3)
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 3,
+                    "state": {
+                        "waiting": {
+                            "reason": "CrashLoopBackOff",
+                            "message": (
+                                "Container repeatedly exited with a non-zero status."
+                            ),
+                        },
+                        "last_state": {
+                            "terminated": {"reason": "Error", "exit_code": 1},
+                        },
+                    },
+                },
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = "ERROR Application process exited with code 1."
+    elif fault_type == "OOMKilled":
+        incident["restart_count"] = max(incident.get("restart_count", 0), 2)
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 2,
+                    "state": {
+                        "terminated": {"reason": "OOMKilled", "exit_code": 137},
+                    },
+                },
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = "Container terminated with exit code 137 (OOMKilled)."
+        if not any(
+            event.get("reason") == "OOMKilled"
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "OOMKilled",
+                    "message": "Container exceeded its memory limit and was killed.",
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "ImagePullError":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 0,
+                    "state": {
+                        "waiting": {
+                            "reason": "ImagePullBackOff",
+                            "message": "The requested container image could not be pulled.",
+                        },
+                    },
+                },
+            ]
+        if not any(
+            "pull image" in event.get("message", "").lower()
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "Failed",
+                    "message": "Failed to pull image: manifest not found.",
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "ConfigError":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": False,
+                    "restart_count": 0,
+                    "state": {
+                        "waiting": {
+                            "reason": "CreateContainerConfigError",
+                            "message": "Required Secret or ConfigMap was not found.",
+                        },
+                    },
+                },
+            ]
+        if not any(
+            "configerror" in event.get("message", "").lower()
+            for event in incident["kubernetes_events"]
+        ):
+            incident["kubernetes_events"].append(
+                {
+                    "reason": "Failed",
+                    "message": (
+                        "CreateContainerConfigError: referenced Secret or ConfigMap "
+                        "does not exist."
+                    ),
+                    "type": "Warning",
+                }
+            )
+    elif fault_type == "CPUThrottle":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restart_count": 0,
+                    "state": {},
+                }
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = (
+                "CPU usage is at the configured container limit; throttled CPU "
+                "periods are elevated."
+            )
+    elif fault_type == "NetworkLatency":
+        if not incident["container_statuses"]:
+            incident["container_statuses"] = [
+                {
+                    "name": "app",
+                    "ready": True,
+                    "restart_count": 0,
+                    "state": {},
+                }
+            ]
+        if not incident["recent_logs"]:
+            incident["recent_logs"] = (
+                "Network probe reports elevated round-trip latency of 400 ms; "
+                "packet loss is not detected."
+            )
 
 
 def _enrich_from_cluster(incident: dict, scenario: ScenarioSpec) -> dict:
@@ -151,7 +316,11 @@ def _enrich_from_cluster(incident: dict, scenario: ScenarioSpec) -> dict:
             max((s["restart_count"] for s in statuses), default=0) if statuses else 0
         )
     except Exception as exc:
-        print(f"[harness] Cluster enrichment failed ({exc}); using stub incident")
+        _apply_scenario_stub_signals(incident, scenario)
+        print(
+            f"[harness] Cluster enrichment failed ({exc}); "
+            "using deterministic scenario stub signals"
+        )
 
     return incident
 
@@ -163,13 +332,15 @@ def _run_trial(
     trial_index: int,
     methods: list[str],
     dry_run: bool = False,
+    incident: Optional[dict] = None,
 ) -> list[EvalResult]:
     """
     Run all requested methods on a single trial of a single scenario.
 
     Returns a list of EvalResults (one per method).
     """
-    incident = _build_incident_from_scenario(scenario, trial_index)
+    if incident is None:
+        incident = _build_incident_from_scenario(scenario, trial_index)
     results: list[EvalResult] = []
 
     for method in methods:
@@ -196,7 +367,6 @@ def _run_trial(
                     incident, trial_index,
                     scenario.ground_truth_category, scenario.is_novel,
                 )
-                time.sleep(LLM_INTER_CALL_SLEEP)
 
         elif method == "llm_rag":
             if dry_run:
@@ -207,7 +377,26 @@ def _run_trial(
                     incident, trial_index,
                     scenario.ground_truth_category, scenario.is_novel,
                 )
-                time.sleep(LLM_INTER_CALL_SLEEP)
+
+        elif method in FINETUNED_LOCAL_METHODS:
+            if dry_run:
+                r = _stub_result(method, scenario, trial_index)
+            else:
+                from eval.local_llm_methods import diagnose_local
+                r = diagnose_local(
+                    method, incident, trial_index,
+                    scenario.ground_truth_category, scenario.is_novel,
+                )
+
+        elif method in BASE_LOCAL_METHODS:
+            if dry_run:
+                r = _stub_result(method, scenario, trial_index)
+            else:
+                from eval.local_base_llm_methods import diagnose_local
+                r = diagnose_local(
+                    method, incident, trial_index,
+                    scenario.ground_truth_category, scenario.is_novel,
+                )
 
         else:
             print(f"[harness] Unknown method: {method}, skipping")
@@ -224,7 +413,7 @@ def _run_trial(
 
 
 def _stub_result(method: str, scenario: ScenarioSpec, trial_index: int) -> EvalResult:
-    """Return a placeholder EvalResult for dry-runs (no API calls made)."""
+    """Return a placeholder EvalResult for dry-runs (no LLM inference made)."""
     from eval.types import SAFE_ACTIONS
     return EvalResult(
         method=method,
@@ -239,7 +428,7 @@ def _stub_result(method: str, scenario: ScenarioSpec, trial_index: int) -> EvalR
         latency_ms=0.0,
         api_cost_usd=0.0,
         confidence="N/A",
-        root_cause="DRY_RUN — no API call made",
+        root_cause="DRY_RUN — no LLM inference made",
         explanation="",
         retrieval_mode="N/A",
     )
@@ -286,8 +475,11 @@ def run(
     """
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure the RAG index is built once before any llm_rag calls.
-    if "llm_rag" in methods and not dry_run:
+    # Build the RAG index once for remote or local RAG methods.
+    if (
+        ("llm_rag" in methods or any(method in LOCAL_RAG_METHODS for method in methods))
+        and not dry_run
+    ):
         print("[harness] Building RAG index …")
         rag_engine.build_index()
 
@@ -299,10 +491,40 @@ def run(
     all_results: list[EvalResult] = []
     total = len(scenarios) * n_trials * len(methods)
     done = 0
+    local_methods = [method for method in methods if method in LOCAL_LLM_METHODS]
+    non_local_methods = [
+        method for method in methods if method not in LOCAL_LLM_METHODS
+    ]
+    trial_incidents: list[tuple[ScenarioSpec, int, dict]] = []
+    local_model_metadata = {}
+    if local_methods:
+        if any(method in FINETUNED_LOCAL_METHODS for method in local_methods):
+            from eval.local_llm_methods import (
+                get_local_model_metadata as get_finetuned_model_metadata,
+            )
+
+            finetuned_methods = [
+                method for method in local_methods
+                if method in FINETUNED_LOCAL_METHODS
+            ]
+            local_model_metadata.update(
+                get_finetuned_model_metadata(finetuned_methods)
+            )
+        if any(method in BASE_LOCAL_METHODS for method in local_methods):
+            from eval.local_base_llm_methods import (
+                get_local_model_metadata as get_base_model_metadata,
+            )
+
+            base_methods = [
+                method for method in local_methods
+                if method in BASE_LOCAL_METHODS
+            ]
+            local_model_metadata.update(get_base_model_metadata(base_methods))
 
     run_meta = {
         "harness_version": "1.0.0",
         "model": config.MODEL,
+        "local_models": local_model_metadata,
         "n_trials": n_trials,
         "methods": methods,
         "scenarios": [s.name for s in scenarios],
@@ -315,20 +537,76 @@ def run(
         fh.write(json.dumps({"type": "meta", **run_meta}) + "\n")
         fh.flush()
 
+        def record_results(trial_results: list[EvalResult]) -> None:
+            nonlocal done
+            for result in trial_results:
+                fh.write(json.dumps(_result_to_dict(result)) + "\n")
+                fh.flush()
+                all_results.append(result)
+                done += 1
+
         for scenario in scenarios:
             print(f"\n[harness] Scenario: {scenario.name} "
                   f"(novel={scenario.is_novel}, truth={scenario.ground_truth_category})")
 
             for trial_index in range(n_trials):
-                trial_results = _run_trial(scenario, trial_index, methods, dry_run)
-                for r in trial_results:
-                    row = _result_to_dict(r)
-                    fh.write(json.dumps(row) + "\n")
-                    fh.flush()
-                    all_results.append(r)
-                    done += len(trial_results)
+                incident = _build_incident_from_scenario(scenario, trial_index)
+                trial_incidents.append((scenario, trial_index, incident))
+                trial_results = _run_trial(
+                    scenario, trial_index, non_local_methods, dry_run, incident
+                )
+                record_results(trial_results)
 
                 print(f"  [harness] {done}/{total} calls done")
+
+        if local_methods and not dry_run:
+            from eval.local_llm_methods import (
+                release_local_model as release_finetuned_model,
+            )
+            from eval.local_base_llm_methods import (
+                release_local_model as release_base_model,
+            )
+
+            try:
+                selected_model_groups = [
+                    tuple(method for method in local_methods if method in model_group)
+                    for model_group in LOCAL_MODEL_GROUPS
+                ]
+                selected_model_groups = [
+                    group for group in selected_model_groups if group
+                ]
+                selected_model_groups.sort(
+                    key=lambda group: min(local_methods.index(method) for method in group)
+                )
+                for selected_group in selected_model_groups:
+
+                    # Only one model family/size is resident at a time on a
+                    # constrained GPU; RAG and no-RAG variants share weights.
+                    release_finetuned_model()
+                    release_base_model()
+                    for method in selected_group:
+                        print(f"\n[harness] Evaluating {method} across all trials")
+                        for scenario, trial_index, incident in trial_incidents:
+                            trial_results = _run_trial(
+                                scenario, trial_index, [method], incident=incident
+                            )
+                            record_results(trial_results)
+                            print(f"  [harness] {done}/{total} calls done")
+                    release_finetuned_model()
+                    release_base_model()
+            finally:
+                release_finetuned_model()
+                release_base_model()
+        elif local_methods:
+            for method in local_methods:
+                for scenario, trial_index, incident in trial_incidents:
+                    record_results(
+                        _run_trial(
+                            scenario, trial_index, [method], dry_run=True,
+                            incident=incident,
+                        )
+                    )
+                    print(f"  [harness] {done}/{total} calls done")
 
     print(f"\n[harness] Evaluation complete. {len(all_results)} results -> {output_path}")
     return all_results
@@ -351,9 +629,9 @@ def _parse_args(argv=None):
         help="Which scenario set to run (default: all)",
     )
     p.add_argument(
-        "--methods", nargs="+", default=ALL_METHODS,
+        "--methods", nargs="+", default=DEFAULT_METHODS,
         choices=ALL_METHODS,
-        help="Which methods to run (default: all four)",
+        help="Which methods to run (default: existing four methods)",
     )
     p.add_argument(
         "--output", default=None,
@@ -361,7 +639,7 @@ def _parse_args(argv=None):
     )
     p.add_argument(
         "--dry-run", action="store_true",
-        help="Build incident dicts and run non-LLM methods; skip API calls",
+        help="Build incident dicts and skip all LLM inference",
     )
     return p.parse_args(argv)
 
