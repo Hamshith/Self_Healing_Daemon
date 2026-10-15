@@ -4,7 +4,7 @@ A Python daemon that monitors a minikube Kubernetes cluster, detects multiple Ku
 
 Gemini returns an ordered `remediation_steps` list with an allow-listed action for each step. The remediator executes only supported Kubernetes operations (`delete_pod` and `increase_memory_limit`) when `safe_to_auto_remediate` is true; human-only work is returned as `escalate`. After every successful remediation the daemon **polls the pod for up to 2 minutes** and only records the incident as remediated once the pod is stable. If it never stabilises the pre-action snapshot is used to roll back the change automatically.
 
-A companion **comparative evaluation framework** (`eval/`) lets you compare rule-based and Random Forest baselines, Gemini with/without RAG, and evaluation-only fine-tuned and untuned local Qwen 3B/7B models on identical fault instances. Local models are only loaded by the evaluation harness and do not affect daemon inference.
+A companion **comparative evaluation framework** (`eval/`) lets you compare rule-based and Random Forest baselines, Gemini with/without RAG, and fine-tuned and untuned local Qwen 3B/7B models on identical fault instances. The daemon preloads the fine-tuned Qwen 3B model as a no-RAG fallback and keeps it resident; other local models remain evaluation-only.
 
 ---
 
@@ -305,7 +305,14 @@ FP16 compute, and automatic CPU placement to limit GPU memory use. On a 4 GB
 GPU, the default GPU budget is 3072 MiB with 512 MiB reserved; the 7B model may
 spill to system RAM and run slowly. A CUDA-enabled PyTorch build compatible with
 the NVIDIA driver, plus Transformers, Accelerate, and bitsandbytes, is required.
-PEFT is additionally required for the fine-tuned adapter methods.
+PEFT is additionally required for the fine-tuned adapter methods. The daemon
+loads the fine-tuned 3B model during startup, before polling begins, and keeps
+it resident for its lifetime. It uses this model without RAG if a Gemini
+request fails or Gemini still does not return valid JSON after its retry. The
+daemon requires the adapter files, a CUDA-enabled PyTorch build, and enough free
+GPU memory; startup fails explicitly if the fallback cannot be loaded.
+`QWEN_FALLBACK_GPU_MEMORY_MIB`
+defaults to `3072` and `QWEN_FALLBACK_GPU_RESERVE_MIB` defaults to `512`.
 
 The untuned methods load `Qwen/Qwen2.5-3B-Instruct` and
 `Qwen/Qwen2.5-7B-Instruct` directly, without loading a PEFT/LoRA adapter. They

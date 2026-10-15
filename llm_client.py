@@ -12,6 +12,7 @@ from google.genai import types
 from google.api_core.exceptions import ResourceExhausted
 import config
 import rag_engine
+import qwen_fallback
 
 
 SYSTEM_PROMPT = (
@@ -146,7 +147,33 @@ def _call_gemini(user_prompt: str) -> str:
         ),
     )
     print("[agent] Gemini response received")
+    if not isinstance(response.text, str) or not response.text.strip():
+        raise ValueError("Gemini returned an empty response.")
     return response.text
+
+
+def initialize_fallback_model() -> None:
+    """Load the resident Qwen fallback before daemon polling begins."""
+    qwen_fallback.load_model()
+
+
+def _parse_diagnosis(raw: str) -> dict:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("Gemini returned an empty response.")
+    diagnosis = json.loads(_strip_markdown_fences(raw))
+    if not isinstance(diagnosis, dict):
+        raise ValueError("Gemini response was not a JSON object.")
+    return diagnosis
+
+
+def _use_qwen_fallback(incident_data: dict, reason: Exception) -> dict:
+    print(
+        f"[llm_client] Gemini diagnosis failed ({reason}); "
+        "using fine-tuned Qwen 3B fallback."
+    )
+    diagnosis = qwen_fallback.diagnose(incident_data)
+    print("[llm_client] Fine-tuned Qwen 3B fallback diagnosis received.")
+    return diagnosis
 
 
 def diagnose_incident(incident_data: dict) -> dict:
@@ -154,74 +181,44 @@ def diagnose_incident(incident_data: dict) -> dict:
     Build a prompt from *incident_data*, call Gemini, and return
     the parsed JSON diagnosis dict.
 
-    Handles:
-      - ResourceExhausted (rate limit) → wait 30 s and retry once
-      - JSON parse failure             → retry once asking for valid JSON
+    Gemini rate limits and invalid JSON are retried once. If Gemini still
+    fails to return a valid JSON diagnosis, the resident fine-tuned Qwen model
+    is used instead.
     """
-    user_prompt = _build_user_prompt(incident_data)
     print(
         f"[agent] Diagnosing incident: pod={incident_data.get('pod_name', 'unknown')} "
         f"fault={incident_data.get('fault_type', 'unknown')}"
     )
 
-    # ── First attempt ──────────────────────────────────────────────
     try:
-        raw = _call_gemini(user_prompt)
-    except ResourceExhausted:
-        print("[llm_client] Rate-limited by Gemini — waiting 30 s …")
-        time.sleep(30)
-        raw = _call_gemini(user_prompt)
+        user_prompt = _build_user_prompt(incident_data)
+        try:
+            raw = _call_gemini(user_prompt)
+        except ResourceExhausted:
+            print("[llm_client] Rate-limited by Gemini — waiting 30 s …")
+            time.sleep(30)
+            raw = _call_gemini(user_prompt)
 
-    # ── Strip markdown fences and parse JSON ───────────────────────
-    cleaned = _strip_markdown_fences(raw)
-    try:
-        diagnosis = json.loads(cleaned)
+        try:
+            diagnosis = _parse_diagnosis(raw)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            retry_prompt = (
+                user_prompt
+                + "\n\nIMPORTANT: Your previous response was not valid JSON. "
+                "Please respond with valid JSON only. No markdown, no extra text."
+            )
+            try:
+                raw = _call_gemini(retry_prompt)
+            except ResourceExhausted:
+                print("[llm_client] Rate-limited on retry — waiting 30 s …")
+                time.sleep(30)
+                raw = _call_gemini(retry_prompt)
+            diagnosis = _parse_diagnosis(raw)
+
         print(
             f"[agent] Diagnosis parsed: category={diagnosis.get('root_cause_category')} "
             f"severity={diagnosis.get('severity')}"
         )
         return diagnosis
-    except json.JSONDecodeError:
-        pass  # will retry
-
-    # ── Retry once, explicitly asking for valid JSON ───────────────
-    retry_prompt = (
-        user_prompt
-        + "\n\nIMPORTANT: Your previous response was not valid JSON. "
-        "Please respond with valid JSON only. No markdown, no extra text."
-    )
-    try:
-        raw = _call_gemini(retry_prompt)
-    except ResourceExhausted:
-        print("[llm_client] Rate-limited on retry — waiting 30 s …")
-        time.sleep(30)
-        raw = _call_gemini(retry_prompt)
-
-    cleaned = _strip_markdown_fences(raw)
-    try:
-        diagnosis = json.loads(cleaned)
-        print(
-            f"[agent] Retry diagnosis parsed: category={diagnosis.get('root_cause_category')} "
-            f"severity={diagnosis.get('severity')}"
-        )
-        return diagnosis
-    except json.JSONDecodeError:
-        # Return a best-effort fallback so the daemon doesn't crash
-        print("[agent] Diagnosis parsing failed twice; escalating with fallback")
-        return {
-            "root_cause": "Unable to parse LLM response",
-            "error": "The incident diagnosis could not be determined because the LLM response was invalid.",
-            "root_cause_category": "Unknown",
-            "confidence": "low",
-            "evidence": [raw[:500]],
-            "severity": "medium",
-            "explanation": "The LLM did not return valid JSON after two attempts.",
-            "recommended_action": "Manually inspect the pod logs.",
-            "remediation_steps": [{
-                "step": 1,
-                "action": "escalate",
-                "reason": "LLM response could not be parsed safely.",
-                "parameters": {},
-            }],
-            "safe_to_auto_remediate": False,
-        }
+    except Exception as exc:
+        return _use_qwen_fallback(incident_data, exc)

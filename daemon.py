@@ -208,6 +208,9 @@ def _startup_checks():
         print("Copy .env.example to .env and add your API key.")
         sys.exit(1)
 
+    print("[daemon] Loading required fine-tuned Qwen 3B fallback before polling.")
+    llm_client.initialize_fallback_model()
+
     try:
         count = rag_engine.build_index()
         print(f"[rag_engine] Indexed {count} runbook chunks.")
